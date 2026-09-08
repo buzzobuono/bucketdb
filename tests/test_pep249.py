@@ -87,12 +87,13 @@ class TestConnectionObject:
         cur = conn.cursor()
         assert cur is not None
 
-    def test_close_makes_connection_unusable(self, s3):
+    def test_close_makes_connection_unusable(self, s3, moto_server):
         c = s3ql.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
             aws_region=REGION,
+            endpoint_url=moto_server,
         )
         c.close()
         with pytest.raises(InterfaceError):

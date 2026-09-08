@@ -73,7 +73,7 @@ def _create_table(conn: "S3QLConnection", sql: str) -> int:
     # Let DuckDB parse and create an empty in-memory table, then export to S3
     conn.db.execute(f'CREATE TABLE _tmp_{table_name} {sql[sql.index("("):]}')
     rel = conn.db.execute(f"SELECT * FROM _tmp_{table_name} LIMIT 0")
-    arrow_table = rel.arrow()
+    arrow_table = rel.to_arrow_table()
     conn.db.execute(f"DROP TABLE _tmp_{table_name}")
 
     uri = conn.config.table_uri(table_name)
@@ -143,14 +143,14 @@ def _copy_on_write(
     # 2. Apply the DML on the in-memory copy (swap view name for table name)
     dml = _replace_table_ref(sql, table_name, f"_cow_{table_name}")
     if parameters:
-        conn.db.execute(dml, parameters)
+        rel = conn.db.execute(dml, parameters)
     else:
-        conn.db.execute(dml)
+        rel = conn.db.execute(dml)
 
-    rows_affected = conn.db.execute("SELECT changes()").fetchone()[0]
+    rows_affected = rel.fetchone()[0]
 
     # 3. Export back to S3
-    arrow_table = conn.db.execute(f"SELECT * FROM _cow_{table_name}").arrow()
+    arrow_table = conn.db.execute(f"SELECT * FROM _cow_{table_name}").to_arrow_table()
     _write_parquet_to_s3(conn, uri, arrow_table)
 
     # 4. Refresh the view and clean up

@@ -3,11 +3,9 @@ Optimistic transaction tests — commit/rollback with ETag conflict detection.
 """
 import io
 
-import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from moto import mock_aws
 
 import s3ql
 from s3ql.exceptions import OperationalError
@@ -158,35 +156,32 @@ class TestReadYourWrites:
 # ---------------------------------------------------------------------------
 
 class TestConflict:
-    def test_conflict_raises_on_commit(self, aws_credentials):
+    def test_conflict_raises_on_commit(self, s3, moto_server):
         """Simulate a concurrent write between our DML and our commit."""
-        with mock_aws():
-            s3 = boto3.client("s3", region_name=REGION)
-            s3.create_bucket(Bucket=BUCKET)
+        with s3ql.connect(
+            bucket=BUCKET,
+            aws_access_key_id=FAKE_KEY,
+            aws_secret_access_key=FAKE_SECRET,
+            aws_region=REGION,
+            endpoint_url=moto_server,
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE orders (id INTEGER, amount DOUBLE)")
+            conn.commit()
 
-            with s3ql.connect(
-                bucket=BUCKET,
-                aws_access_key_id=FAKE_KEY,
-                aws_secret_access_key=FAKE_SECRET,
-                aws_region=REGION,
-            ) as conn:
-                cur = conn.cursor()
-                cur.execute("CREATE TABLE orders (id INTEGER, amount DOUBLE)")
+            # Start our transaction
+            cur.execute("INSERT INTO orders VALUES (1, 10.0)")
+
+            # Concurrent writer overwrites the file on S3
+            new_table = pa.table(
+                {"id": [99], "amount": [0.0]},
+                schema=pa.schema([("id", pa.int32()), ("amount", pa.float64())]),
+            )
+            _put_parquet(s3, "orders.parquet", new_table)
+
+            # Our commit must detect the ETag mismatch
+            with pytest.raises(OperationalError, match="conflict"):
                 conn.commit()
-
-                # Start our transaction
-                cur.execute("INSERT INTO orders VALUES (1, 10.0)")
-
-                # Concurrent writer overwrites the file on S3
-                new_table = pa.table(
-                    {"id": [99], "amount": [0.0]},
-                    schema=pa.schema([("id", pa.int32()), ("amount", pa.float64())]),
-                )
-                _put_parquet(s3, "orders.parquet", new_table)
-
-                # Our commit must detect the ETag mismatch
-                with pytest.raises(OperationalError, match="conflict"):
-                    conn.commit()
 
     def test_no_conflict_when_file_unchanged(self, orders):
         """Normal commit with no concurrent writer must succeed."""
@@ -197,36 +192,33 @@ class TestConflict:
         cur.execute("SELECT COUNT(*) FROM orders")
         assert cur.fetchone()[0] == 1
 
-    def test_state_preserved_after_conflict(self, aws_credentials):
+    def test_state_preserved_after_conflict(self, s3, moto_server):
         """After a conflict the tx must still be active so caller can rollback."""
-        with mock_aws():
-            s3 = boto3.client("s3", region_name=REGION)
-            s3.create_bucket(Bucket=BUCKET)
+        with s3ql.connect(
+            bucket=BUCKET,
+            aws_access_key_id=FAKE_KEY,
+            aws_secret_access_key=FAKE_SECRET,
+            aws_region=REGION,
+            endpoint_url=moto_server,
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE orders (id INTEGER, amount DOUBLE)")
+            conn.commit()
 
-            with s3ql.connect(
-                bucket=BUCKET,
-                aws_access_key_id=FAKE_KEY,
-                aws_secret_access_key=FAKE_SECRET,
-                aws_region=REGION,
-            ) as conn:
-                cur = conn.cursor()
-                cur.execute("CREATE TABLE orders (id INTEGER, amount DOUBLE)")
+            cur.execute("INSERT INTO orders VALUES (1, 10.0)")
+
+            new_table = pa.table(
+                {"id": [99], "amount": [0.0]},
+                schema=pa.schema([("id", pa.int32()), ("amount", pa.float64())]),
+            )
+            _put_parquet(s3, "orders.parquet", new_table)
+
+            with pytest.raises(OperationalError):
                 conn.commit()
 
-                cur.execute("INSERT INTO orders VALUES (1, 10.0)")
-
-                new_table = pa.table(
-                    {"id": [99], "amount": [0.0]},
-                    schema=pa.schema([("id", pa.int32()), ("amount", pa.float64())]),
-                )
-                _put_parquet(s3, "orders.parquet", new_table)
-
-                with pytest.raises(OperationalError):
-                    conn.commit()
-
-                # tx still active: caller can rollback cleanly
-                conn.rollback()
-                assert conn._tx is None
+            # tx still active: caller can rollback cleanly
+            conn.rollback()
+            assert conn._tx is None
 
 
 # ---------------------------------------------------------------------------
@@ -270,85 +262,84 @@ class TestMultiTableAtomicity:
         cur.execute("SELECT COUNT(*) FROM ledger")
         assert cur.fetchone()[0] == 0
 
-    def test_partial_commit_when_second_table_conflicts(self, aws_credentials):
+    def test_partial_commit_when_second_table_conflicts(self, s3, moto_server):
         """
-        Known limitation: if table A commits but table B conflicts,
-        table A is already written to S3. No cross-table rollback is possible.
-        This test documents and asserts the actual behavior.
+        flush() verifies the ETag of every dirty table (phase 1) before writing
+        any of them (phase 2). So when one table conflicts, NO table is written
+        to S3 — there is no partial commit, unlike what older docs claimed.
         """
-        with mock_aws():
-            s3 = boto3.client("s3", region_name=REGION)
-            s3.create_bucket(Bucket=BUCKET)
+        with s3ql.connect(
+            bucket=BUCKET,
+            aws_access_key_id=FAKE_KEY,
+            aws_secret_access_key=FAKE_SECRET,
+            aws_region=REGION,
+            endpoint_url=moto_server,
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE accounts (id INTEGER, balance DOUBLE)")
+            cur.execute("CREATE TABLE ledger (id INTEGER, delta DOUBLE)")
+            conn.commit()
 
-            with s3ql.connect(
-                bucket=BUCKET,
-                aws_access_key_id=FAKE_KEY,
-                aws_secret_access_key=FAKE_SECRET,
-                aws_region=REGION,
-            ) as conn:
-                cur = conn.cursor()
-                cur.execute("CREATE TABLE accounts (id INTEGER, balance DOUBLE)")
-                cur.execute("CREATE TABLE ledger (id INTEGER, delta DOUBLE)")
+            # Snapshot both ETags, then modify both tables in our tx
+            cur.execute("INSERT INTO accounts VALUES (1, 100.0)")
+            cur.execute("INSERT INTO ledger VALUES (1, 100.0)")
+
+            # Concurrent writer modifies 'ledger' only, after our DML
+            new_ledger = pa.table(
+                {"id": [99], "delta": [0.0]},
+                schema=pa.schema([("id", pa.int32()), ("delta", pa.float64())]),
+            )
+            _put_parquet(s3, "ledger.parquet", new_ledger)
+
+            with pytest.raises(OperationalError, match="conflict"):
                 conn.commit()
 
-                # Snapshot both ETags, then modify both tables in our tx
-                cur.execute("INSERT INTO accounts VALUES (1, 100.0)")
-                cur.execute("INSERT INTO ledger VALUES (1, 100.0)")
+            # accounts must NOT have been written: it was still empty on S3
+            # (the conflict on 'ledger' is caught in the verify phase, before
+            # any write happens for any table).
+            accounts_obj = s3.get_object(Bucket=BUCKET, Key="accounts.parquet")
+            accounts_table = pq.read_table(io.BytesIO(accounts_obj["Body"].read()))
+            assert accounts_table.num_rows == 0
 
-                # Concurrent writer modifies 'ledger' only, after our DML
-                new_ledger = pa.table(
-                    {"id": [99], "delta": [0.0]},
-                    schema=pa.schema([("id", pa.int32()), ("delta", pa.float64())]),
-                )
-                _put_parquet(s3, "ledger.parquet", new_ledger)
+            # ledger on S3 must still be exactly what the concurrent writer wrote
+            ledger_obj = s3.get_object(Bucket=BUCKET, Key="ledger.parquet")
+            ledger_table = pq.read_table(io.BytesIO(ledger_obj["Body"].read()))
+            assert ledger_table.column("id").to_pylist() == [99]
 
-                # Commit iterates tables in insertion order:
-                # 'accounts' is checked first and written, 'ledger' conflicts.
-                # Result: accounts IS written, ledger is NOT. Partial commit.
-                with pytest.raises(OperationalError, match="conflict"):
-                    conn.commit()
+            # The transaction is still active: reads go through the in-memory
+            # buffer (read-your-writes), not the S3 state, until rollback/commit.
+            cur2 = conn.cursor()
+            cur2.execute("SELECT id FROM ledger")
+            assert cur2.fetchone()[0] == 1
 
-                # accounts was already written before conflict was detected
-                cur2 = conn.cursor()
-                cur2.execute("SELECT COUNT(*) FROM accounts")
-                # After conflict commit() stops — accounts row may or may not be
-                # written depending on iteration order. We assert the known
-                # invariant: ledger is NOT written (conflict stopped it).
-                cur2.execute("SELECT COUNT(*) FROM ledger")
-                ledger_rows = cur2.fetchone()[0]
-                # The concurrent writer's row (id=99) is on S3; our row (id=1) was not written
-                assert ledger_rows == 1  # only the concurrent writer's row
-                cur2.execute("SELECT id FROM ledger")
-                assert cur2.fetchone()[0] == 99
+            conn.rollback()
+            assert conn._tx is None
 
-    def test_conflict_detection_covers_all_dirty_tables(self, aws_credentials):
+    def test_conflict_detection_covers_all_dirty_tables(self, s3, moto_server):
         """ETag check runs for every dirty table before any write begins."""
-        with mock_aws():
-            s3 = boto3.client("s3", region_name=REGION)
-            s3.create_bucket(Bucket=BUCKET)
+        with s3ql.connect(
+            bucket=BUCKET,
+            aws_access_key_id=FAKE_KEY,
+            aws_secret_access_key=FAKE_SECRET,
+            aws_region=REGION,
+            endpoint_url=moto_server,
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE accounts (id INTEGER, balance DOUBLE)")
+            cur.execute("CREATE TABLE ledger (id INTEGER, delta DOUBLE)")
+            conn.commit()
 
-            with s3ql.connect(
-                bucket=BUCKET,
-                aws_access_key_id=FAKE_KEY,
-                aws_secret_access_key=FAKE_SECRET,
-                aws_region=REGION,
-            ) as conn:
-                cur = conn.cursor()
-                cur.execute("CREATE TABLE accounts (id INTEGER, balance DOUBLE)")
-                cur.execute("CREATE TABLE ledger (id INTEGER, delta DOUBLE)")
+            cur.execute("INSERT INTO accounts VALUES (1, 100.0)")
+            cur.execute("INSERT INTO ledger VALUES (1, 100.0)")
+
+            # Corrupt both tables concurrently
+            for key, col in [("accounts.parquet", "balance"), ("ledger.parquet", "delta")]:
+                schema = pa.schema([("id", pa.int32()), (col, pa.float64())])
+                t = pa.table({"id": [0], col: [0.0]}, schema=schema)
+                _put_parquet(s3, key, t)
+
+            with pytest.raises(OperationalError, match="conflict"):
                 conn.commit()
-
-                cur.execute("INSERT INTO accounts VALUES (1, 100.0)")
-                cur.execute("INSERT INTO ledger VALUES (1, 100.0)")
-
-                # Corrupt both tables concurrently
-                for key, col in [("accounts.parquet", "balance"), ("ledger.parquet", "delta")]:
-                    schema = pa.schema([("id", pa.int32()), (col, pa.float64())])
-                    t = pa.table({"id": [0], col: [0.0]}, schema=schema)
-                    _put_parquet(s3, key, t)
-
-                with pytest.raises(OperationalError, match="conflict"):
-                    conn.commit()
 
 
 # ---------------------------------------------------------------------------

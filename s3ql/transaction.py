@@ -29,10 +29,10 @@ class Transaction:
         temp = self._dirty[table]
         dml = re.sub(rf'\b{re.escape(table)}\b', temp, sql, flags=re.IGNORECASE)
         if params:
-            self._conn.db.execute(dml, params)
+            rel = self._conn.db.execute(dml, params)
         else:
-            self._conn.db.execute(dml)
-        result = self._conn.db.execute("SELECT changes()").fetchone()
+            rel = self._conn.db.execute(dml)
+        result = rel.fetchone()
         return result[0] if result else -1
 
     def flush(self):
@@ -47,7 +47,7 @@ class Transaction:
         for table, temp in self._dirty.items():
             from .writer import _write_parquet_to_s3
             uri = self._conn.config.table_uri(table)
-            arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").arrow()
+            arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
             _write_parquet_to_s3(self._conn, uri, arrow_table)
             self._restore_view(table)
             self._conn.db.execute(f"DROP TABLE IF EXISTS {temp}")

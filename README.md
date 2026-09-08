@@ -80,7 +80,7 @@ except s3ql.OperationalError:
 **Known limitations:**
 
 - DDL (`CREATE TABLE`, `DROP TABLE`) is immediate and not transactional
-- Multi-table commits are not atomic: if table A is written and table B conflicts, table A is already on S3
+- ETags for every dirty table are verified before any table is written, so a conflict on one table blocks the whole commit — no table is left partially written. There is still no cross-object atomicity on S3 itself: a conflicting write landing on a table *during* the write phase (after its own check passed) is not detected
 - `rollback()` has no effect on DDL statements
 
 ## Supported SQL
@@ -93,6 +93,19 @@ FROM orders o
 JOIN customers c ON o.customer_id = c.id
 GROUP BY o.item
 HAVING total > 100
+```
+
+## Command line
+
+`pip install -e .` registers an `s3ql` command: an interactive SQL shell (arrow-key line editing, persistent history in `~/.s3ql_history`) or a one-shot query runner.
+
+Connection parameters are resolved in this order: CLI flags → environment variables → a `.env` file in the current directory (`--env-file` to point elsewhere). All use the same keys: `URL`, `ID`, `SECRET`, `BUCKET`, `REGION`, `PREFIX`.
+
+```bash
+s3ql                              # interactive shell
+s3ql "SELECT * FROM orders"       # one-shot query
+s3ql .tables                      # list discovered tables
+s3ql --bucket my-bucket --endpoint-url http://localhost:9000 "SELECT 1"
 ```
 
 ## PEP 249 compliance

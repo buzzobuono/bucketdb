@@ -35,6 +35,7 @@ class TestCursorLifecycle:
 
     def test_fetchmany_respects_arraysize(self, conn):
         cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id INTEGER, val VARCHAR)")
         for i in range(5):
             cur.execute(f"INSERT INTO t VALUES ({i}, 'v')")
         cur.execute("SELECT id FROM t ORDER BY id")
@@ -61,12 +62,14 @@ class TestCursorDescription:
 class TestParameterBinding:
     def test_qmark_params_select(self, conn):
         cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id INTEGER, val VARCHAR)")
         cur.execute("INSERT INTO t VALUES (1, 'hello')")
         cur.execute("SELECT val FROM t WHERE id = ?", [1])
         assert cur.fetchone()[0] == "hello"
 
     def test_executemany(self, conn):
         cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id INTEGER, val VARCHAR)")
         data = [(i, f"item{i}") for i in range(10)]
         cur.executemany("INSERT INTO t VALUES (?, ?)", data)
         cur.execute("SELECT COUNT(*) FROM t")

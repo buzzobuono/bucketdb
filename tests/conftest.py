@@ -1,8 +1,6 @@
-import os
-
 import boto3
 import pytest
-from moto import mock_aws
+from moto.server import ThreadedMotoServer
 
 import s3ql
 
@@ -12,43 +10,62 @@ FAKE_KEY = "fakekey"
 FAKE_SECRET = "fakesecret"
 
 
-@pytest.fixture()
-def aws_credentials(monkeypatch):
-    """Prevent moto from picking up real AWS credentials."""
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY)
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", FAKE_SECRET)
-    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
-    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+@pytest.fixture(scope="session")
+def moto_server():
+    """A real local HTTP server mocking S3.
+
+    boto3-level mocking (moto's mock_aws decorator) only patches botocore,
+    not DuckDB's httpfs extension, which speaks raw HTTP directly to S3.
+    A real local server is required so both boto3 and DuckDB hit the mock.
+    """
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    host, port = server.get_host_and_port()
+    yield f"http://127.0.0.1:{port}"
+    server.stop()
 
 
 @pytest.fixture()
-def s3(aws_credentials):
-    with mock_aws():
-        client = boto3.client("s3", region_name=REGION)
-        client.create_bucket(Bucket=BUCKET)
-        yield client
+def s3(moto_server):
+    client = boto3.client(
+        "s3",
+        region_name=REGION,
+        aws_access_key_id=FAKE_KEY,
+        aws_secret_access_key=FAKE_SECRET,
+        endpoint_url=moto_server,
+    )
+    client.create_bucket(Bucket=BUCKET)
+    yield client
+    objects = client.list_objects_v2(Bucket=BUCKET).get("Contents", [])
+    if objects:
+        client.delete_objects(
+            Bucket=BUCKET,
+            Delete={"Objects": [{"Key": o["Key"]} for o in objects]},
+        )
+    client.delete_bucket(Bucket=BUCKET)
 
 
 @pytest.fixture()
-def conn(s3):
+def conn(s3, moto_server):
     """Open an S3QL connection against the mocked bucket."""
     with s3ql.connect(
         bucket=BUCKET,
         aws_access_key_id=FAKE_KEY,
         aws_secret_access_key=FAKE_SECRET,
         aws_region=REGION,
+        endpoint_url=moto_server,
     ) as connection:
         yield connection
 
 
 @pytest.fixture()
-def conn_with_prefix(s3):
+def conn_with_prefix(s3, moto_server):
     with s3ql.connect(
         bucket=BUCKET,
         aws_access_key_id=FAKE_KEY,
         aws_secret_access_key=FAKE_SECRET,
         aws_region=REGION,
         prefix="warehouse/",
+        endpoint_url=moto_server,
     ) as connection:
         yield connection

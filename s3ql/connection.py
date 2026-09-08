@@ -109,8 +109,8 @@ class S3QLConnection:
             self._db.execute(f"SET s3_access_key_id='{cfg.aws_access_key_id}';")
             self._db.execute(f"SET s3_secret_access_key='{cfg.aws_secret_access_key}';")
             if cfg.endpoint_url:
-                # Strip protocol for DuckDB endpoint setting
-                endpoint = cfg.endpoint_url.replace("https://", "").replace("http://", "")
+                # Strip protocol and trailing slash for DuckDB's endpoint setting
+                endpoint = cfg.endpoint_url.replace("https://", "").replace("http://", "").rstrip("/")
                 use_ssl = cfg.endpoint_url.startswith("https://")
                 self._db.execute(f"SET s3_endpoint='{endpoint}';")
                 self._db.execute(f"SET s3_use_ssl={'true' if use_ssl else 'false'};")
