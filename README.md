@@ -18,7 +18,7 @@ Your code  →  PEP 249 driver  →  DuckDB (in-memory)  →  S3 (Parquet files)
 
 ## Requirements
 
-- Python ≥ 3.11
+- Python ≥ 3.10
 - `duckdb` ≥ 0.10
 - `boto3` ≥ 1.34
 - `pyarrow` ≥ 15
@@ -123,6 +123,20 @@ s3ql --bucket my-bucket --endpoint-url http://localhost:9000 "SELECT 1"
 | `callproc` | — (no stored procedures in DuckDB) |
 | `nextset` | — (single result set per execute) |
 
+## Examples
+
+`examples/` has standalone scripts (not pytest tests — they hit a **real** S3-compatible bucket) that read connection parameters from a `.env` file in the project root (`URL`, `ID`, `SECRET`, `BUCKET`, `REGION`, `PREFIX`):
+
+- `demo_prodotti_vendite_negozi.py` — creates and seeds a small 3-table schema (`negozi`, `prodotti`, `vendite`)
+- `mostra_dati.py` — lists every discovered table and prints its contents
+- `join_dati.py` — joins the three tables (detail rows, aggregate revenue, grand total)
+
+```bash
+python examples/demo_prodotti_vendite_negozi.py
+python examples/mostra_dati.py
+python examples/join_dati.py
+```
+
 ## Development
 
 ```bash
@@ -130,4 +144,4 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
-Tests use [moto](https://github.com/getmoto/moto) to mock S3 — no real AWS account needed.
+Tests use [moto](https://github.com/getmoto/moto) to mock S3 — no real AWS account needed. Because DuckDB's `httpfs` extension speaks raw HTTP directly to S3 (bypassing boto3/botocore), the fixtures run a real local `moto.server.ThreadedMotoServer` rather than the `@mock_aws` decorator, so both boto3 and DuckDB hit the same mock.
