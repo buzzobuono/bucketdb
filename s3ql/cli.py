@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 import s3ql
-from s3ql.exceptions import Error
+from s3ql.exceptions import Error, ProgrammingError
 
 try:
     import readline  # abilita frecce </> e cronologia su/giù in input()
@@ -34,6 +34,16 @@ ENV_KEYS = {
     "prefix": "PREFIX",
     "endpoint_url": "URL",
 }
+
+DOT_HELP = """\
+Dot command disponibili:
+  .help                      mostra questo messaggio
+  .tables                    elenca le tabelle nel bucket
+  .schema <table>            mostra colonne e tipi della tabella
+  .preload <table> [...]     carica tabelle in memoria (cache)
+  .unload <table> [...]      scarica tabelle dalla memoria
+  .status                    mostra stato connessione e transazione
+  .exit / .quit              chiude la shell"""
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -118,6 +128,79 @@ def run_query(conn, cur, sql: str) -> None:
         print_rows(columns, cur.fetchall())
 
 
+def run_dot(conn, cur, line: str) -> None:
+    parts = line.split()
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd == ".help":
+        print(DOT_HELP)
+
+    elif cmd == ".tables":
+        names = sorted(conn.registry.tables)
+        if names:
+            for name in names:
+                print(name)
+        else:
+            print("(nessuna tabella)")
+
+    elif cmd == ".schema":
+        if not args:
+            print("Uso: .schema <table>")
+            return
+        table = args[0]
+        if not conn.registry.exists(table):
+            print(f"Tabella '{table}' non trovata.")
+            return
+        cur.execute(f'SELECT * FROM "{table}" LIMIT 0')
+        print(f"Tabella: {table}")
+        print(f"{'Colonna':<30}  Tipo")
+        print("-" * 50)
+        for col in cur.description:
+            name = col[0]
+            type_code = col[1] if col[1] is not None else "?"
+            print(f"{name:<30}  {type_code}")
+
+    elif cmd == ".preload":
+        if not args:
+            print("Uso: .preload <table> [table...]")
+            return
+        try:
+            conn.preload(*args)
+            print(f"Preloaded: {', '.join(args)}")
+        except ProgrammingError as exc:
+            print(f"Errore: {exc}")
+
+    elif cmd == ".unload":
+        if not args:
+            print("Uso: .unload <table> [table...]")
+            return
+        try:
+            conn.unload(*args)
+            print(f"Unloaded: {', '.join(args)}")
+        except (ProgrammingError, Exception) as exc:
+            print(f"Errore: {exc}")
+
+    elif cmd == ".status":
+        cfg = conn.config
+        print(f"Bucket:   {cfg.bucket}")
+        print(f"Prefix:   {cfg.prefix or '(none)'}")
+        print(f"Endpoint: {cfg.endpoint_url or 'AWS S3'}")
+        print(f"Tabelle:  {len(conn.registry.tables)}")
+        tx = conn._tx
+        if tx is None:
+            print("Tx:       nessuna transazione attiva")
+        else:
+            loaded = tx.preloaded
+            modified = tx.modified
+            print(f"Tx:       attiva")
+            print(f"  preloaded: {', '.join(loaded) if loaded else '(nessuna)'}")
+            print(f"  modified:  {', '.join(modified) if modified else '(nessuna)'}")
+
+    else:
+        print(f"Comando sconosciuto: '{cmd}'. Digita .help per la lista.")
+
+
 def load_history() -> None:
     if readline is None:
         return
@@ -138,27 +221,26 @@ def save_history() -> None:
 
 
 def interactive_loop(conn, cur) -> None:
-    print("s3ql — digita una query SQL, '.tables' per elencare le tabelle, 'exit' per uscire.")
+    print("s3ql — digita .help per i comandi disponibili, exit per uscire.")
     load_history()
     try:
         while True:
             try:
-                sql = input("sql> ").strip()
+                line = input("sql> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
 
-            if not sql:
+            if not line:
                 continue
-            if sql.lower() in EXIT_COMMANDS:
+            if line.lower() in EXIT_COMMANDS:
                 break
-            if sql == ".tables":
-                for name in sorted(conn.registry.tables):
-                    print(name)
-                continue
 
             try:
-                run_query(conn, cur, sql)
+                if line.startswith("."):
+                    run_dot(conn, cur, line)
+                else:
+                    run_query(conn, cur, line)
             except Error as exc:
                 print(f"Errore: {exc}")
     finally:
@@ -171,7 +253,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "query", nargs="*",
-        help="Query SQL da eseguire una tantum; se assente apre la shell interattiva",
+        help="Query SQL o dot command da eseguire una tantum; se assente apre la shell interattiva",
     )
     parser.add_argument(
         "--env-file", default=".env",
@@ -193,13 +275,12 @@ def main(argv: list[str] | None = None) -> None:
     with s3ql.connect(**config) as conn:
         cur = conn.cursor()
         if args.query:
-            sql = " ".join(args.query)
-            if sql == ".tables":
-                for name in sorted(conn.registry.tables):
-                    print(name)
-                return
+            line = " ".join(args.query)
             try:
-                run_query(conn, cur, sql)
+                if line.startswith("."):
+                    run_dot(conn, cur, line)
+                else:
+                    run_query(conn, cur, line)
             except Error as exc:
                 raise SystemExit(f"Errore: {exc}")
         else:
