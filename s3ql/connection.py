@@ -92,6 +92,18 @@ class S3QLConnection:
     def registry(self) -> "TableRegistry":
         return self._registry
 
+    def preload(self, *tables: str):
+        self._assert_open()
+        self._get_or_begin_tx().preload(*tables)
+
+    def unload(self, *tables: str):
+        self._assert_open()
+        if self._tx is None:
+            raise InterfaceError("No active transaction — nothing to unload")
+        self._tx.unload(*tables)
+        if not self._tx._loaded:
+            self._tx = None
+
     def _get_or_begin_tx(self) -> Transaction:
         if self._tx is None:
             self._tx = Transaction(self)
@@ -103,6 +115,7 @@ class S3QLConnection:
 
     def _setup_duckdb(self):
         try:
+            self._db.execute("SET temp_directory='';")
             self._db.execute("INSTALL httpfs; LOAD httpfs;")
             cfg = self._config
             self._db.execute(f"SET s3_region='{cfg.aws_region}';")
