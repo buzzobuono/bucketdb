@@ -83,6 +83,38 @@ except s3ql.OperationalError:
 - ETags for every dirty table are verified before any table is written, so a conflict on one table blocks the whole commit — no table is left partially written. There is still no cross-object atomicity on S3 itself: a conflicting write landing on a table *during* the write phase (after its own check passed) is not detected
 - `rollback()` has no effect on DDL statements
 
+## In-memory cache: preload and unload
+
+For read-heavy workloads, tables can be explicitly loaded into memory to avoid repeated S3 round trips. Once preloaded, every SELECT on that table reads from memory — zero HTTP requests to S3.
+
+```python
+conn.preload("orders", "customers")   # load into memory once
+cur.execute("SELECT ...")             # → memory
+cur.execute("SELECT ...")             # → memory
+# ... thousands of queries ...
+conn.close()                          # memory freed, nothing written to S3
+```
+
+Tables not preloaded retain the default DuckDB behaviour: pushdown of filters and column projection directly on S3, with HTTP range requests fetching only the needed row groups and columns.
+
+Both patterns can coexist in the same session:
+
+```python
+conn.preload("customers")             # lookup table — many reads, load once
+cur.execute("INSERT INTO orders ...")  # orders loaded automatically on first DML
+conn.commit()                         # only orders is written to S3
+```
+
+To release a preloaded table and restore pushdown before closing the connection:
+
+```python
+conn.unload("orders")   # drops temp table, view points back to S3
+```
+
+`unload` raises `ProgrammingError` if the table has uncommitted changes. Inspect `conn._tx.preloaded` and `conn._tx.modified` to see the current state.
+
+**No local writes** — preloaded data lives exclusively in DuckDB's in-memory buffer. `SET temp_directory=''` is set at connect time so DuckDB raises `OutOfMemoryError` rather than spilling to disk.
+
 ## Supported SQL
 
 Anything DuckDB understands — window functions, CTEs, aggregates, joins across tables in the same bucket.

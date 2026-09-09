@@ -11,7 +11,7 @@ file on S3; DuckDB is the query engine; boto3 talks to S3 for anything DuckDB's
 - `s3ql/connection.py` — `S3QLConnection`; sets up DuckDB's `httpfs` extension for S3 access
 - `s3ql/registry.py` — discovers `.parquet` files on S3 at connect time, maps them to DuckDB views
 - `s3ql/cursor.py` — `S3QLCursor`; dispatches SELECT vs DML (INSERT/UPDATE/DELETE, buffered) vs DDL (CREATE/DROP/ALTER, immediate)
-- `s3ql/transaction.py` — buffers DML in an in-memory DuckDB temp table per dirty table; on `commit()`, verifies the ETag of **every** dirty table before writing **any** of them (no partial commit on conflict)
+- `s3ql/transaction.py` — buffers DML in an in-memory DuckDB temp table per dirty table; on `commit()`, verifies the ETag of **every** dirty table before writing **any** of them (no partial commit on conflict). Also exposes `preload(*tables)` / `unload(*tables)` for explicit in-memory caching. Tracks `_loaded` (all tables in memory) and `_modified` (tables with pending DML) separately — `flush()` writes only `_modified`. A table in `_loaded` but not `_modified` was necessarily preloaded explicitly (the only other path into `_loaded` is `apply()`, which always adds to `_modified`).
 - `s3ql/writer.py` — copy-on-write to S3 for DDL (`_create_table`/`_drop_table`); also has dead `_insert`/`_update`/`_delete`/`_copy_on_write` functions unreachable from `cursor.py` (DML always goes through `transaction.py` instead)
 - `s3ql/cli.py` — the `s3ql` console command (interactive SQL shell + one-shot queries), registered via `[project.scripts]` in `pyproject.toml`
 
