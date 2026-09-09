@@ -142,13 +142,27 @@ Resolved per-parameter in this order — each parameter is independent, so mixed
 3. **`.env` file** — same keys, looked up in the **current working directory** by default; override with `--env-file`
 
 ```bash
-s3ql                                             # interactive shell, params from .env
-s3ql "SELECT * FROM orders"                      # one-shot query
-s3ql .tables                                     # list discovered tables
+s3ql                                              # interactive shell, params from .env
+s3ql "SELECT * FROM orders"                       # one-shot query
+s3ql ".status"                                    # dot command one-shot
 s3ql --bucket other-bucket "SELECT * FROM orders" # override only bucket, rest from .env
-s3ql --env-file /path/to/prod.env "SELECT 1"     # absolute or relative path to .env
-BUCKET=test s3ql "SELECT * FROM orders"          # override via env var
+s3ql --env-file /path/to/prod.env "SELECT 1"      # absolute or relative path to .env
+BUCKET=test s3ql "SELECT * FROM orders"           # override via env var
 ```
+
+### Dot commands
+
+Available in both interactive shell and one-shot mode.
+
+| Command | Description |
+|---|---|
+| `.help` | list all dot commands |
+| `.tables` | list tables discovered in the bucket |
+| `.schema <table>` | show column names and types |
+| `.preload <table> [...]` | load tables into memory (in-memory cache) |
+| `.unload <table> [...]` | release tables from memory, restore S3 pushdown |
+| `.status` | show bucket, prefix, endpoint, and current transaction state |
+| `.exit` / `.quit` | close the shell |
 
 ### Output format
 
