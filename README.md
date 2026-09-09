@@ -131,14 +131,33 @@ HAVING total > 100
 
 `pip install -e .` registers an `s3ql` command: an interactive SQL shell (arrow-key line editing, persistent history in `~/.s3ql_history`) or a one-shot query runner.
 
-Connection parameters are resolved in this order: CLI flags → environment variables → a `.env` file in the current directory (`--env-file` to point elsewhere). All use the same keys: `URL`, `ID`, `SECRET`, `BUCKET`, `REGION`, `PREFIX`.
+If a query argument is provided it runs once and exits; otherwise the interactive shell opens.
+
+### Connection parameters
+
+Resolved per-parameter in this order — each parameter is independent, so mixed configurations are valid:
+
+1. **CLI flags** — `--bucket`, `--id`, `--secret`, `--region`, `--prefix`, `--endpoint-url`
+2. **Environment variables** — `BUCKET`, `ID`, `SECRET`, `REGION`, `PREFIX`, `URL`
+3. **`.env` file** — same keys, looked up in the **current working directory** by default; override with `--env-file`
 
 ```bash
-s3ql                              # interactive shell
-s3ql "SELECT * FROM orders"       # one-shot query
-s3ql .tables                      # list discovered tables
-s3ql --bucket my-bucket --endpoint-url http://localhost:9000 "SELECT 1"
+s3ql                                             # interactive shell, params from .env
+s3ql "SELECT * FROM orders"                      # one-shot query
+s3ql .tables                                     # list discovered tables
+s3ql --bucket other-bucket "SELECT * FROM orders" # override only bucket, rest from .env
+s3ql --env-file /path/to/prod.env "SELECT 1"     # absolute or relative path to .env
+BUCKET=test s3ql "SELECT * FROM orders"          # override via env var
 ```
+
+### Output format
+
+| Statement | Output |
+|---|---|
+| `SELECT` | aligned table with header and separator |
+| `INSERT` / `UPDATE` / `DELETE` | `OK (N righe modificate)` — autocommit applied |
+| `CREATE` / `DROP` | `OK` |
+| Error | error message printed, shell continues |
 
 ## PEP 249 compliance
 
