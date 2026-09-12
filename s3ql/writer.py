@@ -66,15 +66,37 @@ def _create_table(conn: "S3QLConnection", sql: str) -> int:
             return 0
         raise ProgrammingError(f"Table '{table_name}' already exists")
 
-    conn.db.execute(f'CREATE TABLE _tmp_{table_name} {sql[sql.index("("):]}')
+    body = sql[sql.index("("):]
+    pk_cols = _extract_pk_columns(m.group(2))
+
+    conn.db.execute(f'CREATE TABLE _tmp_{table_name} {body}')
     schema = [[r[0], r[1]] for r in conn.db.execute(f"DESCRIBE _tmp_{table_name}").fetchall()]
     conn.db.execute(f"DROP TABLE _tmp_{table_name}")
 
     meta = TableMeta(schema=schema)
+    if pk_cols:
+        meta.sort_by = pk_cols
+        meta.index_name = f"_pk_{table_name}"
+
     key = conn.config.meta_key(table_name)
     write_meta(conn.registry.s3_client, conn.config.bucket, key, meta)
     conn.registry.register_table(table_name, meta)
     return 0
+
+
+def _extract_pk_columns(column_defs: str) -> list[str]:
+    """Extract PRIMARY KEY column names from the column definition block."""
+    # Table-level constraint: PRIMARY KEY (col1, col2)
+    m = re.search(r'\bPRIMARY\s+KEY\s*\(([^)]+)\)', column_defs, re.IGNORECASE)
+    if m:
+        return [c.strip().strip('"\'') for c in m.group(1).split(',')]
+    # Inline constraint: col_name TYPE [NOT NULL] PRIMARY KEY
+    cols = []
+    for segment in column_defs.split(','):
+        if re.search(r'\bPRIMARY\s+KEY\b', segment, re.IGNORECASE):
+            col = segment.strip().split()[0].strip('"\'')
+            cols.append(col)
+    return cols
 
 
 def _drop_table(conn: "S3QLConnection", sql: str) -> int:
