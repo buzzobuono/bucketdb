@@ -13,7 +13,6 @@ from .exceptions import (
     ProgrammingError,
     NotSupportedError,
 )
-from .index_store import IndexStore
 from .registry import TableRegistry
 from .transaction import Transaction
 
@@ -36,11 +35,9 @@ class S3QLConnection:
         self._closed = False
         self._db = duckdb.connect(database=":memory:")
         self._registry = TableRegistry(config, self._db)
-        self._index_store = IndexStore(config, self._registry.s3_client)
         self._tx: Transaction | None = None
         self._setup_duckdb()
-        self._index_store.load()
-        self._registry.discover(self._index_store)
+        self._registry.discover()
 
     # ------------------------------------------------------------------
     # PEP 249 interface
@@ -92,12 +89,8 @@ class S3QLConnection:
         return self._config
 
     @property
-    def registry(self) -> "TableRegistry":
+    def registry(self) -> TableRegistry:
         return self._registry
-
-    @property
-    def index_store(self) -> "IndexStore":
-        return self._index_store
 
     def preload(self, *tables: str):
         self._assert_open()
@@ -110,6 +103,12 @@ class S3QLConnection:
         self._tx.unload(*tables)
         if not self._tx._loaded:
             self._tx = None
+
+    def vacuum(self, table_name: str):
+        """Compact all data files for a table into one, applying sort key if set."""
+        self._assert_open()
+        from .writer import vacuum as do_vacuum
+        do_vacuum(self, table_name)
 
     def _get_or_begin_tx(self) -> Transaction:
         if self._tx is None:
@@ -129,7 +128,6 @@ class S3QLConnection:
             self._db.execute(f"SET s3_access_key_id='{cfg.aws_access_key_id}';")
             self._db.execute(f"SET s3_secret_access_key='{cfg.aws_secret_access_key}';")
             if cfg.endpoint_url:
-                # Strip protocol and trailing slash for DuckDB's endpoint setting
                 endpoint = cfg.endpoint_url.replace("https://", "").replace("http://", "").rstrip("/")
                 use_ssl = cfg.endpoint_url.startswith("https://")
                 self._db.execute(f"SET s3_endpoint='{endpoint}';")

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -11,7 +11,6 @@ class S3Config:
     endpoint_url: str | None = None
 
     def __post_init__(self):
-        # Normalize prefix: no leading slash, trailing slash always present if non-empty
         self.prefix = self.prefix.strip("/")
         if self.prefix:
             self.prefix += "/"
@@ -19,19 +18,21 @@ class S3Config:
     def s3_base_uri(self) -> str:
         return f"s3://{self.bucket}/{self.prefix}"
 
-    def table_uri(self, table_name: str) -> str:
-        return f"{self.s3_base_uri()}{table_name}.parquet"
-
-    def table_base_prefix(self, table_name: str) -> str:
-        """S3 key prefix for a partitioned table's directory (no leading s3://)."""
+    def table_prefix(self, table_name: str) -> str:
+        """S3 key prefix for all objects belonging to a table."""
         return f"{self.prefix}{table_name}/"
 
-    def table_glob_uri(self, table_name: str, n_part_cols: int) -> str:
-        """Glob URI matching all partition data files for a partitioned table."""
-        part_pattern = "/".join(["*=*"] * n_part_cols)
-        return f"s3://{self.bucket}/{self.prefix}{table_name}/{part_pattern}/part-0.parquet"
+    def meta_key(self, table_name: str) -> str:
+        """S3 key for the table's _meta.json file."""
+        return f"{self.prefix}{table_name}/_meta.json"
 
-    def partition_s3_key(self, table_name: str, part_cols: list[str], part_vals: tuple) -> str:
-        """S3 key for a specific partition's data file."""
-        path = "/".join(f"{col}={val}" for col, val in zip(part_cols, part_vals))
-        return f"{self.prefix}{table_name}/{path}/part-0.parquet"
+    def file_uri(self, table_name: str, rel_path: str) -> str:
+        """Full S3 URI for a file given its path relative to the table prefix."""
+        return f"s3://{self.bucket}/{self.prefix}{table_name}/{rel_path}"
+
+    def data_file_key(self, table_name: str, filename: str) -> str:
+        """S3 key for a data file inside the table's data/ directory."""
+        return f"{self.prefix}{table_name}/data/{filename}"
+
+    def data_file_uri(self, table_name: str, filename: str) -> str:
+        return f"s3://{self.bucket}/{self.prefix}{table_name}/data/{filename}"

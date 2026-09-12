@@ -42,6 +42,7 @@ Dot command disponibili:
   .schema <table>            mostra colonne e tipi della tabella
   .preload <table> [...]     carica tabelle in memoria (cache)
   .unload <table> [...]      scarica tabelle dalla memoria
+  .vacuum <table>            compatta i file dati della tabella
   .status                    mostra stato connessione e transazione
   .exit / .quit              chiude la shell"""
 
@@ -179,6 +180,16 @@ def run_dot(conn, cur, line: str) -> None:
             conn.unload(*args)
             print(f"Unloaded: {', '.join(args)}")
         except (ProgrammingError, Exception) as exc:
+            print(f"Errore: {exc}")
+
+    elif cmd == ".vacuum":
+        if not args:
+            print("Uso: .vacuum <table>")
+            return
+        try:
+            conn.vacuum(args[0])
+            print(f"OK — {args[0]} compattata")
+        except ProgrammingError as exc:
             print(f"Errore: {exc}")
 
     elif cmd == ".status":

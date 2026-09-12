@@ -4,6 +4,11 @@ import re
 from typing import TYPE_CHECKING
 
 from .exceptions import OperationalError, ProgrammingError
+from .meta import (
+    TableMeta, FileMeta, new_filename,
+    read_meta, write_meta, get_meta_etag,
+    build_read_sql, build_empty_sql,
+)
 
 if TYPE_CHECKING:
     from .connection import S3QLConnection
@@ -17,11 +22,11 @@ _TABLE_RE = re.compile(
 class Transaction:
     def __init__(self, conn: "S3QLConnection"):
         self._conn = conn
-        # For flat tables: table → ETag string
-        # For partitioned tables: table → {s3_key: ETag} dict
-        self._snapshots: dict[str, str | dict[str, str]] = {}
-        self._loaded: dict[str, str] = {}   # table → DuckDB temp table name
-        self._modified: set[str] = set()    # tables with pending DML
+        self._snapshots: dict[str, str] = {}    # table → ETag of _meta.json at load time
+        self._loaded: dict[str, str] = {}       # table → DuckDB temp table name
+        self._modified: set[str] = set()        # tables with pending DML
+        self._insert_only: set[str] = set()     # tables with INSERT only (no UPDATE/DELETE)
+        self._metas: dict[str, TableMeta] = {}  # cached meta per loaded table
 
     # ------------------------------------------------------------------
     # Public API
@@ -44,15 +49,27 @@ class Transaction:
                 )
             temp = self._loaded.pop(table)
             self._snapshots.pop(table, None)
+            self._metas.pop(table, None)
             self._conn.db.execute(f"DROP TABLE IF EXISTS {temp}")
             self._restore_view(table)
 
     def apply(self, sql: str, params: list) -> int:
         table = self._extract_table(sql)
+        keyword = sql.strip().split()[0].upper()
+
         if not self._conn.registry.exists(table):
             raise ProgrammingError(f"Table '{table}' does not exist")
-        if table not in self._loaded:
-            self._load(table)
+
+        if keyword == "INSERT":
+            if table not in self._loaded:
+                self._load_insert_only(table)
+            # If already fully loaded, apply normally (insert_only flag already off)
+        else:  # UPDATE or DELETE
+            if table not in self._loaded:
+                self._load(table)
+            elif table in self._insert_only:
+                self._upgrade_to_full_load(table)
+
         self._modified.add(table)
         temp = self._loaded[table]
         dml = re.sub(rf'\b{re.escape(table)}\b', temp, sql, flags=re.IGNORECASE)
@@ -68,41 +85,30 @@ class Transaction:
 
         # Phase 1: verify ETags for all modified tables
         for table in self._modified:
-            if self._conn.index_store.is_partitioned(table):
-                self._verify_etags_partitioned(table)
-            else:
-                current = self._etag_flat(table)
-                if current != self._snapshots[table]:
-                    raise OperationalError(
-                        f"Commit conflict: table '{table}' was modified by another writer"
-                    )
+            key = self._conn.config.meta_key(table)
+            current = get_meta_etag(self._conn.registry.s3_client, self._conn.config.bucket, key)
+            if current != self._snapshots[table]:
+                raise OperationalError(
+                    f"Commit conflict: table '{table}' was modified by another writer"
+                )
 
-        # Phase 2: write modified tables to S3
+        # Phase 2: write
         for table in self._modified:
-            temp = self._loaded[table]
-            idef = self._conn.index_store.get_for_table(table)
-
-            if idef and idef.partitioned:
-                import pyarrow as pa
-                arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
-                _write_partitioned_arrow(self._conn, table, idef.columns, arrow_table)
-                self._conn.registry.register_partitioned(table, idef.columns, idef.schema or [])
+            if table in self._insert_only:
+                self._flush_insert_only(table)
             else:
-                uri = self._conn.config.table_uri(table)
-                arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
-                if idef and idef.columns and len(arrow_table) > 0:
-                    arrow_table = arrow_table.sort_by(
-                        [(col, "ascending") for col in idef.columns]
-                    )
-                _write_parquet_to_s3(self._conn, uri, arrow_table)
+                self._flush_full(table)
 
-        # Phase 3: drop all temp tables and restore views
+        # Phase 3: drop temp tables and restore views
         for table, temp in self._loaded.items():
             self._conn.db.execute(f"DROP TABLE IF EXISTS {temp}")
             self._restore_view(table)
+
         self._snapshots.clear()
         self._loaded.clear()
         self._modified.clear()
+        self._insert_only.clear()
+        self._metas.clear()
 
     def discard(self):
         for table, temp in self._loaded.items():
@@ -111,6 +117,8 @@ class Transaction:
         self._snapshots.clear()
         self._loaded.clear()
         self._modified.clear()
+        self._insert_only.clear()
+        self._metas.clear()
 
     @property
     def preloaded(self) -> list[str]:
@@ -121,88 +129,151 @@ class Transaction:
         return list(self._modified)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Load helpers
     # ------------------------------------------------------------------
 
     def _load(self, table: str):
-        temp = f"_tx_{table}"
-        if self._conn.index_store.is_partitioned(table):
-            self._snapshots[table] = self._etag_partitioned(table)
-            idef = self._conn.index_store.get_for_table(table)
-            n = len(idef.columns)
-            glob_uri = self._conn.config.table_glob_uri(table, n)
-            try:
-                self._conn.db.execute(
-                    f"CREATE OR REPLACE TABLE {temp} AS "
-                    f"SELECT * FROM read_parquet('{glob_uri}', hive_partitioning=True)"
-                )
-            except Exception:
-                # No partition files yet — empty table with schema
-                schema = idef.schema or []
-                if schema:
-                    cols_sql = ", ".join(
-                        f'NULL::{dtype} AS "{col}"' for col, dtype in schema
-                    )
-                    self._conn.db.execute(
-                        f"CREATE OR REPLACE TABLE {temp} AS SELECT {cols_sql} WHERE 1=0"
-                    )
-                else:
-                    self._conn.db.execute(f"CREATE OR REPLACE TABLE {temp} (dummy INTEGER)")
-        else:
-            uri = self._conn.config.table_uri(table)
-            self._snapshots[table] = self._etag_flat(table)
-            self._conn.db.execute(
-                f"CREATE OR REPLACE TABLE {temp} AS SELECT * FROM read_parquet('{uri}')"
-            )
+        """Full load: reads all existing data files into a DuckDB temp table."""
+        meta = self._read_meta(table)
+        self._metas[table] = meta
+        self._snapshots[table] = self._meta_etag(table)
+        self._insert_only.discard(table)
 
+        temp = f"_tx_{table}"
+        files_sql = self._files_sql(meta, table)
+        if files_sql:
+            self._conn.db.execute(f"CREATE OR REPLACE TABLE {temp} AS {files_sql}")
+        else:
+            self._conn.db.execute(
+                f"CREATE OR REPLACE TABLE {temp} AS {build_empty_sql(meta.schema)}"
+            )
         self._loaded[table] = temp
         self._conn.db.execute(f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM {temp}')
 
-    def _restore_view(self, table: str):
-        idef = self._conn.index_store.get_for_table(table)
-        if idef and idef.partitioned:
-            self._conn.registry.register_partitioned(table, idef.columns, idef.schema or [])
+    def _load_insert_only(self, table: str):
+        """Lightweight load: only schema, no data. Used for INSERT-only transactions."""
+        meta = self._read_meta(table)
+        self._metas[table] = meta
+        self._snapshots[table] = self._meta_etag(table)
+        self._insert_only.add(table)
+
+        temp = f"_tx_{table}"
+        # Empty buffer with correct schema
+        self._conn.db.execute(
+            f"CREATE OR REPLACE TABLE {temp} AS {build_empty_sql(meta.schema)}"
+        )
+        self._loaded[table] = temp
+
+        # View: existing files UNION ALL new buffer (so SELECT sees all data)
+        existing_sql = self._files_sql(meta, table)
+        if existing_sql:
+            view_sql = f"({existing_sql}) UNION ALL SELECT * FROM {temp}"
         else:
-            uri = self._conn.config.table_uri(table)
+            view_sql = f"SELECT * FROM {temp}"
+        self._conn.db.execute(f'CREATE OR REPLACE VIEW "{table}" AS {view_sql}')
+
+    def _upgrade_to_full_load(self, table: str):
+        """Promote an insert-only buffer to a full load (needed for UPDATE/DELETE)."""
+        temp = self._loaded[table]
+        meta = self._metas[table]
+
+        staging = f"_staging_{table}"
+        existing_sql = self._files_sql(meta, table)
+        if existing_sql:
+            self._conn.db.execute(f"CREATE OR REPLACE TABLE {staging} AS {existing_sql}")
+        else:
             self._conn.db.execute(
-                f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM read_parquet(\'{uri}\')'
+                f"CREATE OR REPLACE TABLE {staging} AS {build_empty_sql(meta.schema)}"
             )
+        # Merge buffered inserts into the full dataset
+        self._conn.db.execute(f"INSERT INTO {staging} SELECT * FROM {temp}")
+        self._conn.db.execute(f"DROP TABLE IF EXISTS {temp}")
+        self._conn.db.execute(f"ALTER TABLE {staging} RENAME TO {temp}")
 
-    def _etag_flat(self, table: str) -> str:
-        uri = self._conn.config.table_uri(table)
-        bucket = self._conn.config.bucket
-        key = uri[len(f"s3://{bucket}/"):]
-        try:
-            resp = self._conn.registry.s3_client.head_object(Bucket=bucket, Key=key)
-            return resp["ETag"]
-        except Exception as exc:
-            raise OperationalError(f"Cannot read ETag for '{table}': {exc}") from exc
+        self._conn.db.execute(f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM {temp}')
+        self._insert_only.discard(table)
 
-    def _etag_partitioned(self, table: str) -> dict[str, str]:
-        """Return {s3_key: etag} for all current partition files."""
-        bucket = self._conn.config.bucket
-        prefix = self._conn.config.table_base_prefix(table)
-        s3 = self._conn.registry.s3_client
-        etags: dict[str, str] = {}
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".parquet"):
-                    etags[key] = obj["ETag"]
-        return etags
+    # ------------------------------------------------------------------
+    # Flush helpers
+    # ------------------------------------------------------------------
 
-    def _verify_etags_partitioned(self, table: str):
-        """Check that no partition files changed since load time."""
-        snapshot = self._snapshots[table]  # {key: etag}
-        if not isinstance(snapshot, dict):
+    def _flush_insert_only(self, table: str):
+        """Write only the new rows as a new data file; append to meta file list."""
+        from .writer import _write_parquet_to_s3, _write_partitioned_arrow
+
+        temp = self._loaded[table]
+        meta = self._metas[table]
+        arrow = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
+
+        if len(arrow) == 0:
             return
-        current = self._etag_partitioned(table)
-        for key, etag in snapshot.items():
-            if current.get(key) != etag:
-                raise OperationalError(
-                    f"Commit conflict: partition '{key}' was modified by another writer"
-                )
+
+        if meta.partition_by:
+            new_files = _write_partitioned_arrow(
+                self._conn, table, meta.partition_by, arrow, meta.sort_by
+            )
+            meta.files.extend(new_files)
+        else:
+            if meta.sort_by:
+                arrow = arrow.sort_by([(col, "ascending") for col in meta.sort_by])
+            filename = new_filename()
+            uri = self._conn.config.data_file_uri(table, filename)
+            _write_parquet_to_s3(self._conn, uri, arrow)
+            meta.files.append(FileMeta(path=f"data/{filename}"))
+
+        self._write_meta(table, meta)
+
+    def _flush_full(self, table: str):
+        """Write consolidated data file(s); old files become orphans for vacuum."""
+        from .writer import _write_parquet_to_s3, _write_partitioned_arrow
+
+        temp = self._loaded[table]
+        meta = self._metas[table]
+        arrow = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
+
+        if meta.partition_by:
+            new_files = _write_partitioned_arrow(
+                self._conn, table, meta.partition_by, arrow, meta.sort_by
+            ) if len(arrow) > 0 else []
+        else:
+            if meta.sort_by and len(arrow) > 0:
+                arrow = arrow.sort_by([(col, "ascending") for col in meta.sort_by])
+            if len(arrow) > 0:
+                filename = new_filename()
+                uri = self._conn.config.data_file_uri(table, filename)
+                _write_parquet_to_s3(self._conn, uri, arrow)
+                new_files = [FileMeta(path=f"data/{filename}")]
+            else:
+                new_files = []
+
+        meta.files = new_files  # old files are now orphans
+        self._write_meta(table, meta)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _read_meta(self, table: str) -> TableMeta:
+        key = self._conn.config.meta_key(table)
+        return read_meta(self._conn.registry.s3_client, self._conn.config.bucket, key)
+
+    def _meta_etag(self, table: str) -> str:
+        key = self._conn.config.meta_key(table)
+        return get_meta_etag(self._conn.registry.s3_client, self._conn.config.bucket, key)
+
+    def _write_meta(self, table: str, meta: TableMeta):
+        key = self._conn.config.meta_key(table)
+        write_meta(self._conn.registry.s3_client, self._conn.config.bucket, key, meta)
+        self._conn.registry.register_table(table, meta)
+
+    def _files_sql(self, meta: TableMeta, table: str) -> str | None:
+        uris = [self._conn.config.file_uri(table, f.path) for f in meta.files]
+        return build_read_sql(meta, uris)
+
+    def _restore_view(self, table: str):
+        meta = self._metas.get(table) or self._conn.registry.meta(table)
+        if meta:
+            self._conn.registry.register_table(table, meta)
 
     @staticmethod
     def _extract_table(sql: str) -> str:
