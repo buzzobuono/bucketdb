@@ -13,6 +13,7 @@ from .exceptions import (
     ProgrammingError,
     NotSupportedError,
 )
+from .index_store import IndexStore
 from .registry import TableRegistry
 from .transaction import Transaction
 
@@ -35,9 +36,11 @@ class S3QLConnection:
         self._closed = False
         self._db = duckdb.connect(database=":memory:")
         self._registry = TableRegistry(config, self._db)
+        self._index_store = IndexStore(config, self._registry.s3_client)
         self._tx: Transaction | None = None
         self._setup_duckdb()
-        self._registry.discover()
+        self._index_store.load()
+        self._registry.discover(self._index_store)
 
     # ------------------------------------------------------------------
     # PEP 249 interface
@@ -91,6 +94,10 @@ class S3QLConnection:
     @property
     def registry(self) -> "TableRegistry":
         return self._registry
+
+    @property
+    def index_store(self) -> "IndexStore":
+        return self._index_store
 
     def preload(self, *tables: str):
         self._assert_open()

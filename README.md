@@ -115,6 +115,67 @@ conn.unload("orders")   # drops temp table, view points back to S3
 
 **No local writes** — preloaded data lives exclusively in DuckDB's in-memory buffer. `SET temp_directory=''` is set at connect time so DuckDB raises `OutOfMemoryError` rather than spilling to disk.
 
+## Indexes
+
+Indexes optimize read and write performance for large tables. Each table supports one index.
+
+### Sort key
+
+Keeps the Parquet file physically ordered by one or more columns. DuckDB uses the row-group min/max statistics to skip entire blocks during scans — equivalent to a clustered index.
+
+```sql
+CREATE INDEX idx_date ON orders (date)
+CREATE INDEX idx_region_date ON orders (region, date)  -- compound sort key
+```
+
+On `commit()`, the rows are written to S3 already sorted. Range queries and equality filters on the leading column(s) benefit automatically via DuckDB's predicate pushdown — no query changes required.
+
+### Partitioned index
+
+Splits the table into one Parquet file per distinct value combination, stored under a Hive-style directory structure:
+
+```
+s3://bucket/prefix/orders/region=IT/part-0.parquet
+                          region=DE/part-0.parquet
+```
+
+```sql
+CREATE INDEX idx_region ON orders (region) PARTITIONED
+CREATE INDEX idx_region_year ON orders (region, year) PARTITIONED  -- two-level
+```
+
+Benefits:
+- **Writes** — `commit()` rewrites only the partition(s) touched by the DML, not the whole table
+- **Reads** — DuckDB opens only the files matching the filter; partitions not matching `WHERE region='IT'` are never read
+
+The partition key order matters: `WHERE region=X` prunes at the first level; `WHERE year=X` alone cannot prune. Put the most-filtered column first.
+
+### Index metadata
+
+Index definitions are persisted in `_s3ql_meta.json` at the S3 prefix root and loaded automatically at connect time. The file is created on the first `CREATE INDEX` and absent if no indexes exist.
+
+### DDL reference
+
+```sql
+-- Create
+CREATE INDEX idx_name ON table (col1, col2)
+CREATE INDEX idx_name ON table (col1) PARTITIONED
+CREATE INDEX IF NOT EXISTS idx_name ON table (col)
+
+-- Drop
+DROP INDEX idx_name
+DROP INDEX IF EXISTS idx_name
+```
+
+`DROP TABLE` on an indexed table cleans up both the data files and the index metadata automatically. `DROP INDEX` on a partitioned table merges all partition files back into a single flat Parquet file.
+
+### Limitations
+
+- One index per table
+- `CREATE INDEX` on a non-empty partitioned table rewrites the data immediately (outside the transaction buffer)
+- String partition values with `/` or `=` characters are not supported
+- On `commit()`, all partitions are rewritten — not only the ones touched by the DML. This is because the transaction buffer loads all existing partitions into memory at the first DML statement. The read benefit (partition pruning on SELECT) is fully realised; the write benefit is not. A delta layer would be required to achieve partition-local writes
+
 ## Supported SQL
 
 Anything DuckDB understands — window functions, CTEs, aggregates, joins across tables in the same bucket.

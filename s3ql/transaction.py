@@ -17,9 +17,11 @@ _TABLE_RE = re.compile(
 class Transaction:
     def __init__(self, conn: "S3QLConnection"):
         self._conn = conn
-        self._snapshots: dict[str, str] = {}  # table → ETag at load time
-        self._loaded: dict[str, str] = {}      # table → DuckDB temp table name
-        self._modified: set[str] = set()       # tables with pending DML
+        # For flat tables: table → ETag string
+        # For partitioned tables: table → {s3_key: ETag} dict
+        self._snapshots: dict[str, str | dict[str, str]] = {}
+        self._loaded: dict[str, str] = {}   # table → DuckDB temp table name
+        self._modified: set[str] = set()    # tables with pending DML
 
     # ------------------------------------------------------------------
     # Public API
@@ -62,22 +64,39 @@ class Transaction:
         return result[0] if result else -1
 
     def flush(self):
-        # Phase 1: verify ETag only for modified tables
+        from .writer import _write_parquet_to_s3, _write_partitioned_arrow
+
+        # Phase 1: verify ETags for all modified tables
         for table in self._modified:
-            current = self._etag(table)
-            if current != self._snapshots[table]:
-                raise OperationalError(
-                    f"Commit conflict: table '{table}' was modified by another writer"
-                )
-        # Phase 2: write only modified tables to S3
-        from .writer import _write_parquet_to_s3
+            if self._conn.index_store.is_partitioned(table):
+                self._verify_etags_partitioned(table)
+            else:
+                current = self._etag_flat(table)
+                if current != self._snapshots[table]:
+                    raise OperationalError(
+                        f"Commit conflict: table '{table}' was modified by another writer"
+                    )
+
+        # Phase 2: write modified tables to S3
         for table in self._modified:
             temp = self._loaded[table]
-            uri = self._conn.config.table_uri(table)
-            arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
-            _write_parquet_to_s3(self._conn, uri, arrow_table)
+            idef = self._conn.index_store.get_for_table(table)
 
-        # Phase 3: drop all loaded tables and restore views
+            if idef and idef.partitioned:
+                import pyarrow as pa
+                arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
+                _write_partitioned_arrow(self._conn, table, idef.columns, arrow_table)
+                self._conn.registry.register_partitioned(table, idef.columns, idef.schema or [])
+            else:
+                uri = self._conn.config.table_uri(table)
+                arrow_table = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
+                if idef and idef.columns and len(arrow_table) > 0:
+                    arrow_table = arrow_table.sort_by(
+                        [(col, "ascending") for col in idef.columns]
+                    )
+                _write_parquet_to_s3(self._conn, uri, arrow_table)
+
+        # Phase 3: drop all temp tables and restore views
         for table, temp in self._loaded.items():
             self._conn.db.execute(f"DROP TABLE IF EXISTS {temp}")
             self._restore_view(table)
@@ -106,24 +125,50 @@ class Transaction:
     # ------------------------------------------------------------------
 
     def _load(self, table: str):
-        uri = self._conn.config.table_uri(table)
-        self._snapshots[table] = self._etag(table)
         temp = f"_tx_{table}"
-        self._conn.db.execute(
-            f"CREATE OR REPLACE TABLE {temp} AS SELECT * FROM read_parquet('{uri}')"
-        )
+        if self._conn.index_store.is_partitioned(table):
+            self._snapshots[table] = self._etag_partitioned(table)
+            idef = self._conn.index_store.get_for_table(table)
+            n = len(idef.columns)
+            glob_uri = self._conn.config.table_glob_uri(table, n)
+            try:
+                self._conn.db.execute(
+                    f"CREATE OR REPLACE TABLE {temp} AS "
+                    f"SELECT * FROM read_parquet('{glob_uri}', hive_partitioning=True)"
+                )
+            except Exception:
+                # No partition files yet — empty table with schema
+                schema = idef.schema or []
+                if schema:
+                    cols_sql = ", ".join(
+                        f'NULL::{dtype} AS "{col}"' for col, dtype in schema
+                    )
+                    self._conn.db.execute(
+                        f"CREATE OR REPLACE TABLE {temp} AS SELECT {cols_sql} WHERE 1=0"
+                    )
+                else:
+                    self._conn.db.execute(f"CREATE OR REPLACE TABLE {temp} (dummy INTEGER)")
+        else:
+            uri = self._conn.config.table_uri(table)
+            self._snapshots[table] = self._etag_flat(table)
+            self._conn.db.execute(
+                f"CREATE OR REPLACE TABLE {temp} AS SELECT * FROM read_parquet('{uri}')"
+            )
+
         self._loaded[table] = temp
-        self._conn.db.execute(
-            f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM {temp}'
-        )
+        self._conn.db.execute(f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM {temp}')
 
     def _restore_view(self, table: str):
-        uri = self._conn.config.table_uri(table)
-        self._conn.db.execute(
-            f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM read_parquet(\'{uri}\')'
-        )
+        idef = self._conn.index_store.get_for_table(table)
+        if idef and idef.partitioned:
+            self._conn.registry.register_partitioned(table, idef.columns, idef.schema or [])
+        else:
+            uri = self._conn.config.table_uri(table)
+            self._conn.db.execute(
+                f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM read_parquet(\'{uri}\')'
+            )
 
-    def _etag(self, table: str) -> str:
+    def _etag_flat(self, table: str) -> str:
         uri = self._conn.config.table_uri(table)
         bucket = self._conn.config.bucket
         key = uri[len(f"s3://{bucket}/"):]
@@ -132,6 +177,32 @@ class Transaction:
             return resp["ETag"]
         except Exception as exc:
             raise OperationalError(f"Cannot read ETag for '{table}': {exc}") from exc
+
+    def _etag_partitioned(self, table: str) -> dict[str, str]:
+        """Return {s3_key: etag} for all current partition files."""
+        bucket = self._conn.config.bucket
+        prefix = self._conn.config.table_base_prefix(table)
+        s3 = self._conn.registry.s3_client
+        etags: dict[str, str] = {}
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith(".parquet"):
+                    etags[key] = obj["ETag"]
+        return etags
+
+    def _verify_etags_partitioned(self, table: str):
+        """Check that no partition files changed since load time."""
+        snapshot = self._snapshots[table]  # {key: etag}
+        if not isinstance(snapshot, dict):
+            return
+        current = self._etag_partitioned(table)
+        for key, etag in snapshot.items():
+            if current.get(key) != etag:
+                raise OperationalError(
+                    f"Commit conflict: partition '{key}' was modified by another writer"
+                )
 
     @staticmethod
     def _extract_table(sql: str) -> str:
