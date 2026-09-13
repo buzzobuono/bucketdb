@@ -7,8 +7,8 @@ import time as time_module
 
 import pytest
 
-import s3ql
-from s3ql.exceptions import NotSupportedError, ProgrammingError, InterfaceError
+import bucketdb
+from bucketdb.exceptions import NotSupportedError, ProgrammingError, InterfaceError
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
@@ -28,7 +28,7 @@ class TestModuleAttributes:
         assert s3ql.paramstyle in ("qmark", "numeric", "named", "format", "pyformat")
 
     def test_connect_callable(self):
-        assert callable(s3ql.connect)
+        assert callable(bucketdb.connect)
 
     def test_module_exports_type_objects(self):
         for name in ("STRING", "BINARY", "NUMBER", "DATETIME", "ROWID"):
@@ -48,16 +48,16 @@ class TestModuleAttributes:
             assert hasattr(s3ql, name), f"s3ql.{name} missing"
 
     def test_exception_hierarchy(self):
-        assert issubclass(s3ql.Warning, Exception)
-        assert issubclass(s3ql.Error, Exception)
-        assert issubclass(s3ql.InterfaceError, s3ql.Error)
-        assert issubclass(s3ql.DatabaseError, s3ql.Error)
-        assert issubclass(s3ql.DataError, s3ql.DatabaseError)
-        assert issubclass(s3ql.OperationalError, s3ql.DatabaseError)
-        assert issubclass(s3ql.IntegrityError, s3ql.DatabaseError)
-        assert issubclass(s3ql.InternalError, s3ql.DatabaseError)
-        assert issubclass(s3ql.ProgrammingError, s3ql.DatabaseError)
-        assert issubclass(s3ql.NotSupportedError, s3ql.DatabaseError)
+        assert issubclass(bucketdb.Warning, Exception)
+        assert issubclass(bucketdb.Error, Exception)
+        assert issubclass(bucketdb.InterfaceError, bucketdb.Error)
+        assert issubclass(bucketdb.DatabaseError, bucketdb.Error)
+        assert issubclass(bucketdb.DataError, bucketdb.DatabaseError)
+        assert issubclass(bucketdb.OperationalError, bucketdb.DatabaseError)
+        assert issubclass(bucketdb.IntegrityError, bucketdb.DatabaseError)
+        assert issubclass(bucketdb.InternalError, bucketdb.DatabaseError)
+        assert issubclass(bucketdb.ProgrammingError, bucketdb.DatabaseError)
+        assert issubclass(bucketdb.NotSupportedError, bucketdb.DatabaseError)
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ class TestConnectionObject:
         assert cur is not None
 
     def test_close_makes_connection_unusable(self, s3, moto_server):
-        c = s3ql.connect(
+        c = bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -109,8 +109,8 @@ class TestConnectionObject:
             assert hasattr(conn, name), f"conn.{name} missing"
 
     def test_connection_exceptions_are_same_classes(self, conn):
-        assert conn.ProgrammingError is s3ql.ProgrammingError
-        assert conn.NotSupportedError is s3ql.NotSupportedError
+        assert conn.ProgrammingError is bucketdb.ProgrammingError
+        assert conn.NotSupportedError is bucketdb.NotSupportedError
 
 
 # ---------------------------------------------------------------------------
@@ -386,20 +386,20 @@ class TestParameterBinding:
 
 class TestTypeObjects:
     def test_string_is_str(self):
-        assert s3ql.STRING is str
+        assert bucketdb.STRING is str
 
     def test_binary_is_bytes(self):
-        assert s3ql.BINARY is bytes
+        assert bucketdb.BINARY is bytes
 
     def test_number_is_decimal(self):
         from decimal import Decimal
-        assert s3ql.NUMBER is Decimal
+        assert bucketdb.NUMBER is Decimal
 
     def test_datetime_is_datetime(self):
-        assert s3ql.DATETIME is datetime.datetime
+        assert bucketdb.DATETIME is datetime.datetime
 
     def test_rowid_is_int(self):
-        assert s3ql.ROWID is int
+        assert bucketdb.ROWID is int
 
 
 # ---------------------------------------------------------------------------
@@ -408,32 +408,32 @@ class TestTypeObjects:
 
 class TestTypeConstructors:
     def test_date_constructor(self):
-        d = s3ql.Date(2024, 1, 15)
+        d = bucketdb.Date(2024, 1, 15)
         assert isinstance(d, datetime.date)
         assert d.year == 2024
         assert d.month == 1
         assert d.day == 15
 
     def test_time_constructor(self):
-        t = s3ql.Time(10, 30, 0)
+        t = bucketdb.Time(10, 30, 0)
         assert isinstance(t, datetime.time)
         assert t.hour == 10
         assert t.minute == 30
 
     def test_timestamp_constructor(self):
-        ts = s3ql.Timestamp(2024, 6, 1, 12, 0, 0)
+        ts = bucketdb.Timestamp(2024, 6, 1, 12, 0, 0)
         assert isinstance(ts, datetime.datetime)
         assert ts.year == 2024
         assert ts.hour == 12
 
     def test_binary_constructor(self):
-        b = s3ql.Binary(b"\x00\xff")
+        b = bucketdb.Binary(b"\x00\xff")
         assert isinstance(b, bytes)
         assert b == b"\x00\xff"
 
     def test_date_from_ticks(self):
         ticks = datetime.datetime(2024, 3, 15).timestamp()
-        d = s3ql.DateFromTicks(ticks)
+        d = bucketdb.DateFromTicks(ticks)
         assert isinstance(d, datetime.date)
         assert d.year == 2024
         assert d.month == 3
@@ -441,14 +441,14 @@ class TestTypeConstructors:
 
     def test_time_from_ticks(self):
         ticks = datetime.datetime(2024, 1, 1, 8, 30, 0).timestamp()
-        t = s3ql.TimeFromTicks(ticks)
+        t = bucketdb.TimeFromTicks(ticks)
         assert isinstance(t, datetime.time)
         assert t.hour == 8
         assert t.minute == 30
 
     def test_timestamp_from_ticks(self):
         ref = datetime.datetime(2024, 6, 1, 12, 0, 0)
-        ts = s3ql.TimestampFromTicks(ref.timestamp())
+        ts = bucketdb.TimestampFromTicks(ref.timestamp())
         assert isinstance(ts, datetime.datetime)
         assert ts.year == 2024
         assert ts.month == 6

@@ -1,11 +1,11 @@
 """Tests for CREATE INDEX (sort key) and CREATE INDEX ... PARTITIONED."""
 import pytest
-import s3ql
+import bucketdb
 from tests.conftest import BUCKET, REGION, FAKE_KEY, FAKE_SECRET
 
 
 def fresh_conn(moto_server, s3):
-    return s3ql.connect(
+    return bucketdb.connect(
         bucket=BUCKET,
         aws_access_key_id=FAKE_KEY,
         aws_secret_access_key=FAKE_SECRET,

@@ -1,6 +1,6 @@
 import pytest
 
-from s3ql.exceptions import ProgrammingError
+from bucketdb.exceptions import ProgrammingError
 
 
 @pytest.fixture()

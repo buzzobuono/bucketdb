@@ -1,7 +1,7 @@
 import pytest
 
-import s3ql
-from s3ql.exceptions import InterfaceError
+import bucketdb
+from bucketdb.exceptions import InterfaceError
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
@@ -15,7 +15,7 @@ class TestConnect:
         assert cur is not None
 
     def test_close_idempotent(self, s3, moto_server):
-        c = s3ql.connect(
+        c = bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -26,7 +26,7 @@ class TestConnect:
         c.close()  # second close must not raise
 
     def test_cursor_after_close_raises(self, s3, moto_server):
-        c = s3ql.connect(
+        c = bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -41,7 +41,7 @@ class TestConnect:
         conn.commit()  # must not raise
 
     def test_context_manager(self, s3, moto_server):
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,

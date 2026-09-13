@@ -5,7 +5,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import s3ql
+import bucketdb
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
@@ -32,7 +32,7 @@ def prepopulated_s3(s3):
 
 class TestDiscovery:
     def test_tables_discovered_on_connect(self, prepopulated_s3, moto_server):
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -43,7 +43,7 @@ class TestDiscovery:
             assert "orders" in conn.registry.tables
 
     def test_can_query_discovered_table(self, prepopulated_s3, moto_server):
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -55,7 +55,7 @@ class TestDiscovery:
             assert cur.fetchone()[0] == 3
 
     def test_discovered_data_correct(self, prepopulated_s3, moto_server):
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -74,7 +74,7 @@ class TestDiscovery:
         _upload_parquet(s3, "outside.parquet", t)
         _upload_parquet(s3, "ns/inside.parquet", t)
 
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             prefix="ns/",
             aws_access_key_id=FAKE_KEY,

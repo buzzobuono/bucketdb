@@ -1,7 +1,7 @@
 """Cursor-level PEP 249 contract tests."""
 import pytest
 
-from s3ql.exceptions import InterfaceError, ProgrammingError
+from bucketdb.exceptions import InterfaceError, ProgrammingError
 
 
 @pytest.fixture()

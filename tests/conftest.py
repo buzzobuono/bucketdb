@@ -2,7 +2,7 @@ import boto3
 import pytest
 from moto.server import ThreadedMotoServer
 
-import s3ql
+import bucketdb
 
 BUCKET = "test-bucket"
 REGION = "us-east-1"
@@ -48,7 +48,7 @@ def s3(moto_server):
 @pytest.fixture()
 def conn(s3, moto_server):
     """Open an S3QL connection against the mocked bucket."""
-    with s3ql.connect(
+    with bucketdb.connect(
         bucket=BUCKET,
         aws_access_key_id=FAKE_KEY,
         aws_secret_access_key=FAKE_SECRET,
@@ -60,7 +60,7 @@ def conn(s3, moto_server):
 
 @pytest.fixture()
 def conn_with_prefix(s3, moto_server):
-    with s3ql.connect(
+    with bucketdb.connect(
         bucket=BUCKET,
         aws_access_key_id=FAKE_KEY,
         aws_secret_access_key=FAKE_SECRET,

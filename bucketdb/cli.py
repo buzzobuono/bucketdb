@@ -1,5 +1,5 @@
 """
-Editor SQL interattivo (TUI) per s3ql: `s3ql` da riga di comando.
+Editor SQL interattivo (TUI) per bucketdb: `bucketdb` da riga di comando.
 
 I parametri di connessione si risolvono in quest'ordine di priorità:
 1. opzioni da riga di comando (--bucket, --access-key-id, ...)
@@ -12,15 +12,15 @@ import argparse
 import os
 from pathlib import Path
 
-import s3ql
-from s3ql.exceptions import Error, ProgrammingError
+import bucketdb
+from bucketdb.exceptions import Error, ProgrammingError
 
 try:
     import readline  # abilita frecce </> e cronologia su/giù in input()
 except ImportError:
     readline = None  # non disponibile (es. Windows senza pyreadline3)
 
-HISTORY_PATH = Path.home() / ".s3ql_history"
+HISTORY_PATH = Path.home() / ".bucketdb_history"
 HISTORY_MAX_LINES = 1000
 
 EXIT_COMMANDS = {".exit", ".quit", "exit", "quit"}
@@ -232,7 +232,7 @@ def save_history() -> None:
 
 
 def interactive_loop(conn, cur) -> None:
-    print("s3ql — digita .help per i comandi disponibili, exit per uscire.")
+    print("bucketdb — digita .help per i comandi disponibili, exit per uscire.")
     load_history()
     try:
         while True:
@@ -260,7 +260,7 @@ def interactive_loop(conn, cur) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="s3ql", description="Editor SQL interattivo per database s3ql (DuckDB + S3)."
+        prog="bucketdb", description="Editor SQL interattivo per database bucketdb (DuckDB + S3)."
     )
     parser.add_argument(
         "query", nargs="*",
@@ -283,7 +283,7 @@ def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
     config = build_config(args)
 
-    with s3ql.connect(**config) as conn:
+    with bucketdb.connect(**config) as conn:
         cur = conn.cursor()
         if args.query:
             line = " ".join(args.query)

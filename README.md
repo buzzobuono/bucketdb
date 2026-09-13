@@ -1,4 +1,4 @@
-# s3ql
+# bucketdb
 
 A PEP 249-compliant Python SQL driver backed by **DuckDB** and **S3**.
 
@@ -26,15 +26,15 @@ Your code  →  PEP 249 driver  →  DuckDB (in-memory)  →  S3 (Parquet files)
 ## Installation
 
 ```bash
-pip install s3ql
+pip install bucketdb
 ```
 
 ## Usage
 
 ```python
-import s3ql
+import bucketdb
 
-conn = s3ql.connect(
+conn = bucketdb.connect(
     bucket="my-bucket",
     aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
     aws_secret_access_key="wJalrXUtnFEMI/K7MDENG",
@@ -59,7 +59,7 @@ conn.close()
 Context manager is supported:
 
 ```python
-with s3ql.connect(bucket="my-bucket", ...) as conn:
+with bucketdb.connect(bucket="my-bucket", ...) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM orders")
         print(cur.fetchone())
@@ -170,7 +170,7 @@ Writes are buffered in memory until `commit()` is called. At commit time the dri
 try:
     cur.execute("UPDATE orders SET amount = 0.0 WHERE id = 1")
     conn.commit()
-except s3ql.OperationalError:
+except bucketdb.OperationalError:
     conn.rollback()  # discard in-memory buffer, no S3 write
 ```
 
@@ -300,7 +300,7 @@ HAVING total > 100
 
 ## Command line
 
-`pip install -e .` registers an `s3ql` command: an interactive SQL shell (arrow-key line editing, persistent history in `~/.s3ql_history`) or a one-shot query runner.
+`pip install -e .` registers an `bucketdb` command: an interactive SQL shell (arrow-key line editing, persistent history in `~/.bucketdb_history`) or a one-shot query runner.
 
 ### Connection parameters
 
@@ -311,11 +311,11 @@ Resolved per-parameter in this order — each parameter is independent, so mixed
 3. **`.env` file** — same keys, looked up in the **current working directory** by default; override with `--env-file`
 
 ```bash
-s3ql                                              # interactive shell, params from .env
-s3ql "SELECT * FROM orders"                       # one-shot query
-s3ql ".status"                                    # dot command one-shot
-s3ql --bucket other-bucket "SELECT * FROM orders" # override only bucket, rest from .env
-BUCKET=test s3ql "SELECT * FROM orders"           # override via env var
+bucketdb                                              # interactive shell, params from .env
+bucketdb "SELECT * FROM orders"                       # one-shot query
+bucketdb ".status"                                    # dot command one-shot
+bucketdb --bucket other-bucket "SELECT * FROM orders" # override only bucket, rest from .env
+BUCKET=test bucketdb "SELECT * FROM orders"           # override via env var
 ```
 
 ### Dot commands

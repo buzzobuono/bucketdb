@@ -7,8 +7,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import s3ql
-from s3ql.exceptions import OperationalError
+import bucketdb
+from bucketdb.exceptions import OperationalError
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
@@ -158,7 +158,7 @@ class TestReadYourWrites:
 class TestConflict:
     def test_conflict_raises_on_commit(self, s3, moto_server):
         """Simulate a concurrent write between our DML and our commit."""
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -194,7 +194,7 @@ class TestConflict:
 
     def test_state_preserved_after_conflict(self, s3, moto_server):
         """After a conflict the tx must still be active so caller can rollback."""
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -268,7 +268,7 @@ class TestMultiTableAtomicity:
         any of them (phase 2). So when one table conflicts, NO table is written
         to S3 — there is no partial commit, unlike what older docs claimed.
         """
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,
@@ -317,7 +317,7 @@ class TestMultiTableAtomicity:
 
     def test_conflict_detection_covers_all_dirty_tables(self, s3, moto_server):
         """ETag check runs for every dirty table before any write begins."""
-        with s3ql.connect(
+        with bucketdb.connect(
             bucket=BUCKET,
             aws_access_key_id=FAKE_KEY,
             aws_secret_access_key=FAKE_SECRET,

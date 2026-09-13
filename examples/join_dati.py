@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import s3ql
+import bucketdb
 
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
@@ -113,7 +113,7 @@ def main() -> None:
     env = load_env(ENV_PATH)
     config = build_config(env)
 
-    with s3ql.connect(**config) as conn:
+    with bucketdb.connect(**config) as conn:
         cur = conn.cursor()
         run_detail_join(cur)
         run_aggregate_join(cur)

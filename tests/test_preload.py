@@ -3,8 +3,8 @@ Tests for explicit preload/unload — in-memory cache with pushdown fallback.
 """
 import pytest
 
-import s3ql
-from s3ql.exceptions import InterfaceError, ProgrammingError
+import bucketdb
+from bucketdb.exceptions import InterfaceError, ProgrammingError
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
