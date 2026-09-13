@@ -65,9 +65,9 @@ with s3ql.connect(bucket="my-bucket", ...) as conn:
         print(cur.fetchone())
 ```
 
-## How SELECT, INSERT and UPDATE work
+## How SELECT, INSERT, UPDATE and DELETE work
 
-Understanding what happens under the hood helps choose the right index and vacuum strategy.
+Understanding what happens under the hood helps choose the right index strategy.
 
 ### S3 layout
 
@@ -75,76 +75,72 @@ Every table lives in a directory on S3:
 
 ```
 s3://bucket/prefix/orders/
-  _meta.json              ← schema, index info, list of data files
+  _meta.json              ← schema, index info, ordered list of data files
   data/
     part-a1b2c3.parquet   ← immutable data file
     part-d4e5f6.parquet   ← immutable data file
     ...
 ```
 
-`_meta.json` is the single source of truth. It lists every data file that belongs to the table, the schema, and any index configuration. Its ETag is the optimistic lock used to detect concurrent writes.
+`_meta.json` is the single source of truth. It lists every data file that belongs to the table, the schema, and any index configuration. Its ETag is the optimistic lock used to detect concurrent writes. Data files are immutable — writes always produce new files; old files become orphans cleaned up by `vacuum()`.
+
+---
 
 ### SELECT
 
-```
-SELECT * FROM orders WHERE date > '2024-01-01'
-```
+DuckDB reads directly from S3 via HTTP range requests. Each Parquet file has a **footer** containing min/max statistics for every column in every row group (~128 k rows each). DuckDB uses these statistics to skip entire row groups without downloading them — this is called **predicate pushdown**.
 
-1. DuckDB reads the DuckDB view registered for `orders`, which is backed by `read_parquet([file1, file2, ...])`
-2. DuckDB opens each Parquet file and reads its **footer** — a compact block at the end of the file containing min/max statistics for every column in every row group (a row group is typically ~128k rows)
-3. For each row group, if `max(date) ≤ '2024-01-01'`, DuckDB **skips it entirely** without reading the data — this is called predicate pushdown
-4. Only the matching row groups are fetched from S3 via HTTP range requests — not the entire file
+| Configuration | S3 reads | Notes |
+|---|---|---|
+| **No index** | all files, all row groups (full scan) | data in insertion order, overlapping min/max |
+| **Sort key** | all files, few row groups | tight non-overlapping min/max on leading column(s); a point query on 10 M rows reads 1–2 row groups instead of 80 |
+| **Partitioned** | only files for matching partition values | file-level pruning via `_meta.json`; files for other partitions are never opened |
+| **Partitioned + sort key** | only matching partition files, few row groups within them | two-level pruning: file-level first, then row-group within each file |
 
-This means a 10 GB Parquet file with the right row-group statistics may require downloading only a few MB to answer a query. The more selective the filter and the better the data is physically sorted, the fewer row groups are read.
+**Example** — `WHERE region='IT' AND date>'2024-01-01'` on a table partitioned by `region` with sort key `date`:
+1. `_meta.json` is read; only the IT partition file is passed to DuckDB
+2. DuckDB reads the IT file footer and skips row groups where `max(date) ≤ '2024-01-01'`
+3. Only the qualifying row groups are fetched via HTTP range requests
 
-**Without a sort key** the data is written in insertion order. Row groups have overlapping min/max ranges for every column, so predicate pushdown is ineffective — most queries become full scans.
-
-**With a sort key** the data is physically ordered, so row groups have tight, non-overlapping ranges. A `WHERE date = '2024-03-15'` query with 10 M rows and 80 row groups reads 1–2 row groups instead of 80.
+---
 
 ### INSERT
 
-```python
-cur.execute("INSERT INTO orders VALUES (...)")
-conn.commit()
-```
+New rows are never merged with existing data at write time.
 
-1. During the transaction, new rows are buffered in a DuckDB in-memory table. **No existing data is loaded from S3** — only the schema is read from `_meta.json`
-2. The DuckDB view for `orders` is updated to a `UNION ALL` of the existing S3 files and the in-memory buffer, so `SELECT` during the transaction sees all data correctly
-3. At `commit()`: the driver reads the ETag of `_meta.json`, writes the new rows as a new immutable Parquet file (`data/part-{uuid}.parquet`), verifies the ETag is unchanged, then updates `_meta.json` to include the new file
-4. If a concurrent writer changed `_meta.json` between step 3's ETag read and write, `OperationalError` is raised and the transaction remains active for rollback
+| Configuration | S3 reads at commit | S3 writes at commit | Notes |
+|---|---|---|---|
+| **No index** | none | 1 new file | rows appended as-is |
+| **Sort key** | none | 1 new file | new rows sorted before writing |
+| **Partitioned** | none | 1 new file per distinct partition value in the new rows | existing files untouched |
+| **Partitioned + sort key** | none | 1 new file per partition, sorted by sort key within each | existing files untouched |
 
-The existing data files are never touched. Each commit appends a small file. Over time, many small files accumulate — use `vacuum()` to consolidate them.
+Each commit appends one or more small files. Over time files accumulate — use `vacuum()` to consolidate. During the transaction the view is `existing S3 files UNION ALL in-memory buffer`, so SELECT sees the full picture.
+
+---
 
 ### UPDATE and DELETE
 
-```python
-cur.execute("UPDATE orders SET amount = 0 WHERE id = 1")
-conn.commit()
-```
+UPDATE and DELETE require identifying and modifying specific rows. The amount of data read from S3 depends on how precisely the WHERE clause maps to the physical file layout.
 
-**Partitioned tables — partial rewrite.** When the table has a partitioned index and the `WHERE` clause contains an exact equality filter on every partition column, the driver loads and rewrites only the affected partition files:
+| Configuration | S3 reads | S3 writes | Notes |
+|---|---|---|---|
+| **No index** | all files (full scan) | 1 new consolidated file | full rewrite; side-effect: compacts all INSERT deltas |
+| **Sort key** | all files (full scan) | 1 new consolidated file | sort key helps SELECT but not UPDATE/DELETE reads |
+| **Partitioned** — exact filter on all partition columns | only matching partition files | 1 new file per affected partition | unaffected partition files kept as-is on S3 |
+| **Partitioned** — no exact partition filter | all files (full scan) | 1 new file per partition | falls back to full load |
+| **Partitioned + sort key** — exact filter | only matching partition files | 1 new file per affected partition, sorted | unaffected files kept as-is |
+| **Partitioned + sort key** — no exact filter | all files (full scan) | 1 new file per partition, sorted | falls back to full load |
 
-1. The partition values are extracted from the `WHERE` clause (`region = 'IT'`)
-2. Only the matching partition files are loaded into memory; the rest remain on S3 untouched
-3. The DML is applied in memory on those files
-4. At `commit()`: new partition files are written, the ETag of `_meta.json` is verified, then `_meta.json` is updated — unaffected partition files keep their original paths
+**Partition filter extraction** is done by parsing the WHERE clause for equality conditions (`col = 'value'` or `col = 42`). Range conditions, `IN` lists, or expressions involving partition columns do not trigger partial load — the driver falls back to full load.
 
-If the filter cannot be resolved to exact partition values (e.g. `WHERE amount > 100` on a table partitioned by `region`), the driver falls back to a full load.
+If two UPDATE/DELETE statements in the same transaction target different partitions, the driver upgrades to a full load on the second statement to guarantee correctness.
 
-**Non-partitioned tables — full rewrite.** Without partition metadata there is no way to identify which files contain the target rows without reading them all:
-
-1. All data files listed in `_meta.json` are loaded into a DuckDB in-memory table
-2. The DML is applied in memory
-3. At `commit()`: the result is written as a **single new consolidated file**, the ETag of `_meta.json` is verified, then `_meta.json` is updated to reference only the new file
-4. Old files are no longer referenced — they become orphans on S3, cleaned up by `vacuum()`
-
-A useful side-effect: a full-rewrite commit on a table with many INSERT delta files automatically compacts them into one file, equivalent to a vacuum.
-
-UPDATE and DELETE on large non-partitioned tables are expensive: they read and rewrite the full dataset. Design schemas to minimise update-heavy workloads on large tables, or use `preload()` to amortise the load cost across multiple operations in the same transaction.
+---
 
 ### Vacuum
 
-As INSERT commits accumulate, the table grows from one file to many small files. `vacuum()` consolidates them:
+As INSERT commits accumulate, the table grows from one file to many. `vacuum()` consolidates them:
 
 ```python
 conn.vacuum("orders")
@@ -154,6 +150,13 @@ conn.vacuum("orders")
 2. If a sort key is set, the merged data is sorted
 3. The result is written as a single new file (or one file per partition for partitioned tables)
 4. `_meta.json` is updated; old files are deleted from S3
+
+| Configuration | After vacuum |
+|---|---|
+| **No index** | 1 file, insertion order |
+| **Sort key** | 1 file, sorted by key columns |
+| **Partitioned** | 1 file per distinct partition value |
+| **Partitioned + sort key** | 1 file per partition, sorted within each |
 
 Run vacuum during low-traffic windows. There is no auto-vacuum — call it explicitly when the file count in `_meta.json` grows large.
 
