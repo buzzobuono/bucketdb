@@ -6,12 +6,34 @@ build-backend = "setuptools.build_meta"
 name = "bucketdb"
 version = "0.1.0"
 description = "PEP 249 SQL driver backed by DuckDB + S3 (Parquet)"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [
+    { name = "buzzobuono", email = "buzzobuono@users.noreply.github.com" },
+]
+keywords = ["s3", "duckdb", "parquet", "database", "sql", "pep249", "db-api"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+]
 dependencies = [
     "duckdb>=0.10",
     "boto3>=1.34",
     "pyarrow>=15",
 ]
+
+[project.urls]
+Homepage = "https://github.com/buzzobuono/bucketdb"
+Repository = "https://github.com/buzzobuono/bucketdb"
+Issues = "https://github.com/buzzobuono/bucketdb/issues"
 
 [project.scripts]
 bucketdb = "bucketdb.cli:main"
