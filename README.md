@@ -122,14 +122,25 @@ cur.execute("UPDATE orders SET amount = 0 WHERE id = 1")
 conn.commit()
 ```
 
-UPDATE and DELETE require identifying specific rows, which means all existing data must be loaded:
+**Partitioned tables — partial rewrite.** When the table has a partitioned index and the `WHERE` clause contains an exact equality filter on every partition column, the driver loads and rewrites only the affected partition files:
+
+1. The partition values are extracted from the `WHERE` clause (`region = 'IT'`)
+2. Only the matching partition files are loaded into memory; the rest remain on S3 untouched
+3. The DML is applied in memory on those files
+4. At `commit()`: new partition files are written, the ETag of `_meta.json` is verified, then `_meta.json` is updated — unaffected partition files keep their original paths
+
+If the filter cannot be resolved to exact partition values (e.g. `WHERE amount > 100` on a table partitioned by `region`), the driver falls back to a full load.
+
+**Non-partitioned tables — full rewrite.** Without partition metadata there is no way to identify which files contain the target rows without reading them all:
 
 1. All data files listed in `_meta.json` are loaded into a DuckDB in-memory table
 2. The DML is applied in memory
 3. At `commit()`: the result is written as a **single new consolidated file**, the ETag of `_meta.json` is verified, then `_meta.json` is updated to reference only the new file
 4. Old files are no longer referenced — they become orphans on S3, cleaned up by `vacuum()`
 
-UPDATE and DELETE on large tables are therefore expensive: they read and rewrite the full dataset. Design schemas to minimise update-heavy workloads on large tables, or use `preload()` to amortise the load cost across multiple operations in the same transaction.
+A useful side-effect: a full-rewrite commit on a table with many INSERT delta files automatically compacts them into one file, equivalent to a vacuum.
+
+UPDATE and DELETE on large non-partitioned tables are expensive: they read and rewrite the full dataset. Design schemas to minimise update-heavy workloads on large tables, or use `preload()` to amortise the load cost across multiple operations in the same transaction.
 
 ### Vacuum
 
@@ -196,6 +207,8 @@ CREATE INDEX idx ON orders (region, year) PARTITIONED   -- two-level partition
 **What it optimises:** file-level pruning on SELECT, and write locality on INSERT (rows for the same partition go to the same file). Each distinct combination of partition column values is stored in a separate Parquet file. A query with `WHERE region='IT'` reads only the files whose metadata records `region=IT` — files for other regions are never opened.
 
 **Use for:** low-cardinality columns (region, status, year, category). High-cardinality columns (id, timestamp, email) produce one file per value — catastrophic for both S3 costs and query performance.
+
+**UPDATE/DELETE optimisation:** when the `WHERE` clause contains exact equality filters on all partition columns, the driver loads and rewrites only the matching partition files. Files for other partitions are left untouched on S3.
 
 ### Primary key → automatic sort key
 

@@ -234,3 +234,97 @@ class TestVacuum:
         conn.vacuum("v4")
         cur.execute("SELECT COUNT(*) FROM v4")
         assert cur.fetchone()[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Partial-load UPDATE/DELETE on partitioned tables
+# ---------------------------------------------------------------------------
+
+class TestPartitionedPartialLoad:
+    def test_update_only_rewrites_matching_partition(self, conn):
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE sales (region VARCHAR, amount FLOAT)")
+        cur.execute("CREATE INDEX idx ON sales (region) PARTITIONED")
+        cur.execute("INSERT INTO sales VALUES ('IT', 100.0)")
+        cur.execute("INSERT INTO sales VALUES ('DE', 200.0)")
+        conn.commit()
+
+        meta_before = conn.registry.meta("sales")
+        it_file = next(f for f in meta_before.files if f.partition.get("region") == "IT")
+        de_file = next(f for f in meta_before.files if f.partition.get("region") == "DE")
+
+        cur.execute("UPDATE sales SET amount = 999.0 WHERE region = 'IT'")
+        conn.commit()
+
+        meta_after = conn.registry.meta("sales")
+        # DE file must be unchanged (same path)
+        de_after = next(f for f in meta_after.files if f.partition.get("region") == "DE")
+        assert de_after.path == de_file.path
+        # IT file must be a new file
+        it_after = next(f for f in meta_after.files if f.partition.get("region") == "IT")
+        assert it_after.path != it_file.path
+
+        cur.execute("SELECT amount FROM sales WHERE region = 'IT'")
+        assert cur.fetchone()[0] == 999.0
+        cur.execute("SELECT amount FROM sales WHERE region = 'DE'")
+        assert cur.fetchone()[0] == 200.0
+
+    def test_delete_only_rewrites_matching_partition(self, conn):
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE logs (env VARCHAR, msg VARCHAR)")
+        cur.execute("CREATE INDEX idx ON logs (env) PARTITIONED")
+        cur.execute("INSERT INTO logs VALUES ('prod', 'ok')")
+        cur.execute("INSERT INTO logs VALUES ('staging', 'test')")
+        conn.commit()
+
+        meta_before = conn.registry.meta("logs")
+        staging_file = next(f for f in meta_before.files if f.partition.get("env") == "staging")
+
+        cur.execute("DELETE FROM logs WHERE env = 'prod'")
+        conn.commit()
+
+        meta_after = conn.registry.meta("logs")
+        # staging file preserved
+        staging_after = next(f for f in meta_after.files if f.partition.get("env") == "staging")
+        assert staging_after.path == staging_file.path
+
+        cur.execute("SELECT COUNT(*) FROM logs WHERE env = 'prod'")
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT msg FROM logs WHERE env = 'staging'")
+        assert cur.fetchone()[0] == "test"
+
+    def test_unfiltered_update_falls_back_to_full_load(self, conn):
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE orders (region VARCHAR, amount FLOAT)")
+        cur.execute("CREATE INDEX idx ON orders (region) PARTITIONED")
+        cur.execute("INSERT INTO orders VALUES ('IT', 10.0)")
+        cur.execute("INSERT INTO orders VALUES ('DE', 20.0)")
+        conn.commit()
+
+        # No partition filter in WHERE — must fall back to full load and rewrite all
+        cur.execute("UPDATE orders SET amount = amount * 2")
+        conn.commit()
+
+        cur.execute("SELECT amount FROM orders WHERE region = 'IT'")
+        assert cur.fetchone()[0] == 20.0
+        cur.execute("SELECT amount FROM orders WHERE region = 'DE'")
+        assert cur.fetchone()[0] == 40.0
+
+    def test_two_updates_on_different_partitions(self, conn):
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (cat VARCHAR, val INTEGER)")
+        cur.execute("CREATE INDEX idx ON t (cat) PARTITIONED")
+        cur.execute("INSERT INTO t VALUES ('A', 1)")
+        cur.execute("INSERT INTO t VALUES ('B', 2)")
+        conn.commit()
+
+        # First UPDATE: partial load on A
+        cur.execute("UPDATE t SET val = 10 WHERE cat = 'A'")
+        # Second UPDATE: different partition — must upgrade to full load
+        cur.execute("UPDATE t SET val = 20 WHERE cat = 'B'")
+        conn.commit()
+
+        cur.execute("SELECT val FROM t WHERE cat = 'A'")
+        assert cur.fetchone()[0] == 10
+        cur.execute("SELECT val FROM t WHERE cat = 'B'")
+        assert cur.fetchone()[0] == 20
