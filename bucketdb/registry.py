@@ -62,6 +62,19 @@ class TableRegistry:
     def meta(self, table_name: str) -> TableMeta | None:
         return self._metas.get(table_name)
 
+    def pruned_read_sql(self, table_name: str, partition_filter: dict[str, list[str]]) -> str | None:
+        """SQL reading only the data files matching partition_filter for a
+        partitioned table, or None if the table isn't registered."""
+        meta = self._metas.get(table_name)
+        if not meta:
+            return None
+        matched = [
+            f for f in meta.files
+            if all(str(f.partition.get(col, "")) in values for col, values in partition_filter.items())
+        ]
+        uris = [self._config.file_uri(table_name, f.path) for f in matched]
+        return build_read_sql(meta, uris) or build_empty_sql(meta.schema)
+
     def table_for_index(self, index_name: str) -> str | None:
         return self._indexes.get(index_name)
 

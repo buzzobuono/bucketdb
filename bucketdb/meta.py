@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -87,3 +88,39 @@ def build_read_sql(meta: TableMeta, file_uris: list[str]) -> str | None:
 def build_empty_sql(schema: list[list[str]]) -> str:
     cols = ", ".join(f'NULL::{dtype} AS "{col}"' for col, dtype in schema)
     return f"SELECT {cols} WHERE 1=0"
+
+
+def extract_partition_filter(sql: str, partition_cols: list[str]) -> dict[str, list[str]] | None:
+    """Extract equality/IN conditions for partition columns from a WHERE clause.
+
+    Returns {col: [value, ...]} if every partition column has a filter that
+    narrows it to a known, finite set of values (col = value or
+    col IN (v1, v2, ...)), or None if any column is missing a filter or uses
+    an operator we can't narrow from (e.g. NOT IN, <, LIKE).
+    """
+    result: dict[str, list[str]] = {}
+    for col in partition_cols:
+        in_match = re.search(
+            rf"\b{re.escape(col)}\s+(NOT\s+)?IN\s*\(([^)]*)\)", sql, re.IGNORECASE
+        )
+        if in_match:
+            if in_match.group(1):
+                return None  # NOT IN excludes values, doesn't narrow to a set
+            values = [v.strip().strip("'\"") for v in in_match.group(2).split(",")]
+            values = [v for v in values if v]
+            if not values:
+                return None
+            result[col] = values
+            continue
+
+        # String literal: col = 'value'
+        m = re.search(rf"\b{re.escape(col)}\s*=\s*'([^']*)'", sql, re.IGNORECASE)
+        if not m:
+            # Numeric literal: col = 42 or col = 3.14
+            m = re.search(
+                rf"\b{re.escape(col)}\s*=\s*(-?\d+(?:\.\d+)?)\b", sql, re.IGNORECASE
+            )
+        if not m:
+            return None
+        result[col] = [m.group(1)]
+    return result

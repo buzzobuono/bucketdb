@@ -7,7 +7,7 @@ from .exceptions import OperationalError, ProgrammingError
 from .meta import (
     TableMeta, FileMeta, new_filename,
     read_meta, write_meta, get_meta_etag,
-    build_read_sql, build_empty_sql,
+    build_read_sql, build_empty_sql, extract_partition_filter,
 )
 
 if TYPE_CHECKING:
@@ -184,21 +184,21 @@ class Transaction:
         """Load for UPDATE/DELETE: partial for partitioned tables when filter is extractable."""
         meta = self._conn.registry.meta(table)
         if meta and meta.partition_by:
-            pf = self._extract_partition_filter(sql, meta.partition_by)
+            pf = extract_partition_filter(sql, meta.partition_by)
             if pf is not None:
                 self._load_partitioned_partial(table, pf)
                 return
         self._load(table)
 
-    def _load_partitioned_partial(self, table: str, partition_filter: dict[str, str]):
+    def _load_partitioned_partial(self, table: str, partition_filter: dict[str, list[str]]):
         """Load only partition files matching the filter; keep others on S3."""
         meta = self._read_meta(table)
         self._metas[table] = meta
         self._snapshots[table] = self._meta_etag(table)
 
         def matches(f: FileMeta) -> bool:
-            return all(str(f.partition.get(col, "")) == str(val)
-                       for col, val in partition_filter.items())
+            return all(str(f.partition.get(col, "")) in values
+                       for col, values in partition_filter.items())
 
         matched = [f for f in meta.files if matches(f)]
         kept = [f for f in meta.files if not matches(f)]
@@ -352,27 +352,6 @@ class Transaction:
         meta = self._metas.get(table) or self._conn.registry.meta(table)
         if meta:
             self._conn.registry.register_table(table, meta)
-
-    @staticmethod
-    def _extract_partition_filter(sql: str, partition_cols: list[str]) -> dict[str, str] | None:
-        """Extract equality conditions for partition columns from a WHERE clause.
-
-        Returns a dict of {col: value} if all partition columns have exact equality
-        filters, or None if any column is missing or uses a non-equality operator.
-        """
-        result = {}
-        for col in partition_cols:
-            # String literal: col = 'value'
-            m = re.search(rf"\b{re.escape(col)}\s*=\s*'([^']*)'", sql, re.IGNORECASE)
-            if not m:
-                # Numeric literal: col = 42 or col = 3.14
-                m = re.search(
-                    rf"\b{re.escape(col)}\s*=\s*(-?\d+(?:\.\d+)?)\b", sql, re.IGNORECASE
-                )
-            if not m:
-                return None
-            result[col] = m.group(1)
-        return result
 
     @staticmethod
     def _extract_table(sql: str) -> str:
