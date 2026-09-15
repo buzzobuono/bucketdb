@@ -53,6 +53,7 @@ def connect(
     aws_region: str = "us-east-1",
     prefix: str = "",
     endpoint_url: str | None = None,
+    debug_http: bool = False,
 ) -> S3QLConnection:
     from .config import S3Config
     cfg = S3Config(
@@ -63,4 +64,4 @@ def connect(
         prefix=prefix,
         endpoint_url=endpoint_url,
     )
-    return S3QLConnection(cfg)
+    return S3QLConnection(cfg, debug_http=debug_http)

@@ -44,7 +44,11 @@ Dot command disponibili:
   .unload <table> [...]      scarica tabelle dalla memoria
   .vacuum <table>            compatta i file dati della tabella
   .status                    mostra stato connessione e transazione
-  .exit / .quit              chiude la shell"""
+  .exit / .quit              chiude la shell
+
+Con --debug-http ogni richiesta di lettura (GET/HEAD) che DuckDB fa su S3
+viene stampata in tempo reale mentre le query girano (prefisso "[s3]").
+Le scritture passano da boto3, non da DuckDB, quindi non compaiono mai."""
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -276,6 +280,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--region")
     parser.add_argument("--prefix")
     parser.add_argument("--endpoint-url")
+    parser.add_argument(
+        "--debug-http", action="store_true",
+        help="registra le richieste HTTP fatte da DuckDB su S3 (vedi .httplog nella shell)",
+    )
     return parser
 
 
@@ -283,7 +291,7 @@ def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
     config = build_config(args)
 
-    with bucketdb.connect(**config) as conn:
+    with bucketdb.connect(**config, debug_http=args.debug_http) as conn:
         cur = conn.cursor()
         if args.query:
             line = " ".join(args.query)
