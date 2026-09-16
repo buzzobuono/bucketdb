@@ -149,9 +149,6 @@ class S3QLCursor:
         except Exception as exc:
             self._rowcount = -1
             raise ProgrammingError(str(exc)) from exc
-        finally:
-            if self._conn._debug_http:
-                self._conn.drain_http_log()
 
     def executemany(self, operation: str, seq_of_parameters):
         self._assert_open()

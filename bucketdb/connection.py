@@ -99,8 +99,6 @@ class S3QLConnection:
         if debug_http:
             self._enable_http_logging()
         self._registry.discover()
-        if debug_http:
-            self.drain_http_log()
 
     # ------------------------------------------------------------------
     # PEP 249 interface
@@ -113,23 +111,15 @@ class S3QLConnection:
 
     def commit(self):
         self._assert_open()
-        try:
-            if self._tx:
-                self._tx.flush()
-                self._tx = None
-        finally:
-            if self._debug_http:
-                self.drain_http_log()
+        if self._tx:
+            self._tx.flush()
+            self._tx = None
 
     def rollback(self):
         self._assert_open()
-        try:
-            if self._tx:
-                self._tx.discard()
-                self._tx = None
-        finally:
-            if self._debug_http:
-                self.drain_http_log()
+        if self._tx:
+            self._tx.discard()
+            self._tx = None
 
     def close(self):
         if not self._closed:
@@ -218,11 +208,8 @@ class S3QLConnection:
         Readline uses to draw the interactive prompt (arrow-key history,
         line editing). Redirecting fd 1 for the logger breaks Readline, so
         instead the logger writes to a private file and a background thread
-        tails it. `drain_http_log()` (called after every statement, see
-        cursor.py and commit()/rollback() below) blocks until that thread
-        has caught up to the current end of the file, so a statement's own
-        S3 calls are always printed before control returns to the caller —
-        no lag, no bleeding into the next command's output.
+        tails it and prints each entry as it arrives — real-time, without
+        any synchronisation to query boundaries.
 
         Only covers reads: writes go through boto3's put_object (see
         writer.py), never through DuckDB.
@@ -240,7 +227,6 @@ class S3QLConnection:
         except Exception as exc:
             raise OperationalError(f"Failed to enable DuckDB HTTP logging: {exc}") from exc
 
-        self._http_log_bytes_read = 0
         self._http_log_stop = threading.Event()
         self._http_log_thread = threading.Thread(
             target=self._tail_http_log, daemon=True
@@ -266,33 +252,6 @@ class S3QLConnection:
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     self._print_http_log_line(line.decode("utf-8", errors="replace"))
-                self._http_log_bytes_read = f.tell() - len(buffer)
-
-    def drain_http_log(self, timeout: float = 1.0):
-        """Block until every HTTP call made so far has been printed.
-
-        Call this right after a statement completes so its own S3 calls are
-        guaranteed on screen before control returns to the caller (e.g.
-        before the CLI shows the next prompt) — without this, the tailing
-        thread's small polling lag can otherwise let a line surface after
-        the *next* statement has already started.
-        """
-        if not self._debug_http:
-            return
-        path = os.path.join(self._http_log_dir, "duckdb_log_entries.csv")
-        deadline = time.monotonic() + timeout
-        # Two rounds: DuckDB's own file-logging write can trail the SQL call
-        # that triggered it by a few ms (its httpfs layer does some of its
-        # I/O — and apparently some of its logging — off the calling
-        # thread). One extra re-check absorbs that straggler in practice.
-        for _ in range(4):
-            try:
-                target = os.path.getsize(path)
-            except OSError:
-                return
-            while self._http_log_bytes_read < target and time.monotonic() < deadline:
-                time.sleep(0.002)
-            time.sleep(0.05)
 
     @staticmethod
     def _print_http_log_line(line: str):
