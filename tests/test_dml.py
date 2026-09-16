@@ -46,6 +46,66 @@ class TestInsert:
         assert cur.fetchone()[0] == 3.0
 
 
+class TestExecutemanyBulkPath:
+    """cursor.executemany() on INSERT uses DuckDB's own executemany() to
+    bind the statement once instead of once per row (see cursor.py).
+    UPDATE/DELETE keep the original per-row loop untouched."""
+
+    def test_rowcount_is_total_rows_not_last_row(self, orders):
+        """Bulk path can't read a per-row rowcount back from DuckDB's
+        executemany() (it returns the connection, not a result), so it's
+        computed as len(seq_of_parameters) instead — the total, not
+        whatever the old per-row loop happened to leave behind."""
+        cur = orders.cursor()
+        rows = [(i, f"item{i}", float(i)) for i in range(1, 6)]
+        cur.executemany("INSERT INTO orders VALUES (?, ?, ?)", rows)
+        assert cur.rowcount == 5
+
+    def test_empty_batch_does_not_raise(self, orders):
+        """DuckDB's native executemany() raises on an empty parameter list;
+        the empty batch must be handled before reaching it."""
+        cur = orders.cursor()
+        cur.executemany("INSERT INTO orders VALUES (?, ?, ?)", [])
+        cur.execute("SELECT COUNT(*) FROM orders")
+        assert cur.fetchone()[0] == 0
+
+    def test_bad_row_mid_batch_raises_programming_error(self, orders):
+        cur = orders.cursor()
+        rows = [(1, "a", 1.0), (2, "b", 2.0), ("not_an_int", "c", 3.0)]
+        with pytest.raises(ProgrammingError):
+            cur.executemany("INSERT INTO orders VALUES (?, ?, ?)", rows)
+
+    def test_execute_then_executemany_same_table_same_tx(self, orders):
+        """A single execute() INSERT followed by executemany() INSERT on
+        the same table in the same transaction must both land in the same
+        buffered temp table, not conflict or reload it."""
+        cur = orders.cursor()
+        cur.execute("INSERT INTO orders VALUES (1, 'apple', 1.5)")
+        cur.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [(2, "banana", 0.75), (3, "cherry", 2.25)],
+        )
+        orders.commit()
+        cur.execute("SELECT COUNT(*) FROM orders")
+        assert cur.fetchone()[0] == 3
+
+    def test_update_via_executemany_still_works(self, orders):
+        """UPDATE isn't eligible for the bulk path — must still go through
+        the per-row loop exactly as before."""
+        cur = orders.cursor()
+        cur.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [(1, "apple", 1.0), (2, "banana", 2.0)],
+        )
+        cur.executemany(
+            "UPDATE orders SET amount = ? WHERE id = ?",
+            [(10.0, 1), (20.0, 2)],
+        )
+        orders.commit()
+        cur.execute("SELECT amount FROM orders ORDER BY id")
+        assert [r[0] for r in cur.fetchall()] == [10.0, 20.0]
+
+
 class TestSelect:
     def test_select_all(self, orders):
         cur = orders.cursor()

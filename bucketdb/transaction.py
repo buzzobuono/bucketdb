@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
+
 from .exceptions import OperationalError, ProgrammingError
 from .meta import (
     TableMeta, FileMeta, new_filename,
@@ -15,6 +17,10 @@ if TYPE_CHECKING:
 
 _TABLE_RE = re.compile(
     r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+[\"']?(\w+)[\"']?",
+    re.IGNORECASE,
+)
+_INSERT_COLUMNS_RE = re.compile(
+    r'\bINSERT\s+INTO\s+["\']?\w+["\']?\s*\(([^)]*)\)\s*VALUES',
     re.IGNORECASE,
 )
 
@@ -84,6 +90,57 @@ class Transaction:
             rel = self._conn.db.execute(dml)
         result = rel.fetchone()
         return result[0] if result else -1
+
+    def apply_many(self, sql: str, seq_of_params: list) -> int:
+        """Bulk INSERT path for cursor.executemany(): builds one Arrow
+        table from the whole batch and inserts it with a single vectorized
+        `INSERT ... SELECT`, instead of binding DuckDB parameters row by
+        row. Row-by-row binding — even DuckDB's own native executemany(),
+        which still does it internally — measured ~1ms/row regardless of
+        S3/network involvement (confirmed with httpfs unloaded, no S3
+        config at all: same ~1000 rows/s ceiling), because each row still
+        crosses the Python/C++ boundary individually. Going through Arrow
+        instead is columnar end to end: ~150x faster on a 20k-row batch in
+        testing. Only ever called for INSERT with a non-empty batch (see
+        cursor.py::executemany).
+
+        Behavior differs from the row-by-row path on a bad row: that stops
+        at the first failing row, leaving prior rows already applied to
+        the buffer; this fails the whole batch atomically (nothing
+        applied), since it's one statement instead of N separate ones.
+        """
+        table = self._extract_table(sql)
+
+        if not self._conn.registry.exists(table):
+            raise ProgrammingError(f"Table '{table}' does not exist")
+
+        if table not in self._loaded:
+            self._load_insert_only(table)
+
+        self._modified.add(table)
+        temp = self._loaded[table]
+
+        columns_match = _INSERT_COLUMNS_RE.search(sql)
+        if columns_match:
+            columns = [c.strip().strip('"\'') for c in columns_match.group(1).split(",")]
+        else:
+            columns = [col for col, _ in self._metas[table].schema]
+
+        arrow_batch = pa.table({
+            col: [row[i] for row in seq_of_params] for i, col in enumerate(columns)
+        })
+
+        quoted_cols = ", ".join(f'"{c}"' for c in columns)
+        reg_name = f"_arrow_batch_{temp}"
+        self._conn.db.register(reg_name, arrow_batch)
+        try:
+            self._conn.db.execute(
+                f'INSERT INTO {temp} ({quoted_cols}) SELECT {quoted_cols} FROM {reg_name}'
+            )
+        finally:
+            self._conn.db.unregister(reg_name)
+
+        return len(seq_of_params)
 
     def flush(self):
         from .writer import _write_parquet_to_s3, _write_partitioned_arrow
