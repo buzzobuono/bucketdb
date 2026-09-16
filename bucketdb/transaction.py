@@ -97,17 +97,29 @@ class Transaction:
                     f"Commit conflict: table '{table}' was modified by another writer"
                 )
 
-        # Phase 2: write
+        # Phase 2: write. _flush_full always calls _write_meta (even when
+        # the result is empty), which already points the table's view back
+        # at S3 via register_table() — so it's already "restored" by the
+        # time this loop finishes. _flush_insert_only only does that when
+        # it actually wrote a new file; an INSERT that added zero rows
+        # (e.g. INSERT ... SELECT ... WHERE 1=0) returns without touching
+        # the view at all, and still needs phase 3 to restore it.
+        restored: set[str] = set()
         for table in self._modified:
             if table in self._insert_only:
-                self._flush_insert_only(table)
+                if self._flush_insert_only(table):
+                    restored.add(table)
             else:
                 self._flush_full(table)
+                restored.add(table)
 
-        # Phase 3: drop temp tables and restore views
+        # Phase 3: drop temp tables and restore any view phase 2 didn't
+        # already rebuild (unmodified preloaded tables, and the empty-INSERT
+        # case above).
         for table, temp in self._loaded.items():
             self._conn.db.execute(f"DROP TABLE IF EXISTS {temp}")
-            self._restore_view(table)
+            if table not in restored:
+                self._restore_view(table)
 
         self._snapshots.clear()
         self._loaded.clear()
@@ -266,8 +278,10 @@ class Transaction:
     # Flush helpers
     # ------------------------------------------------------------------
 
-    def _flush_insert_only(self, table: str):
-        """Write only the new rows as a new data file; append to meta file list."""
+    def _flush_insert_only(self, table: str) -> bool:
+        """Write only the new rows as a new data file; append to meta file
+        list. Returns whether it actually wrote anything (and therefore
+        already rebuilt the table's view via _write_meta) — see flush()."""
         from .writer import _write_parquet_to_s3, _write_partitioned_arrow
 
         temp = self._loaded[table]
@@ -275,7 +289,7 @@ class Transaction:
         arrow = self._conn.db.execute(f"SELECT * FROM {temp}").to_arrow_table()
 
         if len(arrow) == 0:
-            return
+            return False
 
         if meta.partition_by:
             new_files = _write_partitioned_arrow(
@@ -291,6 +305,7 @@ class Transaction:
             meta.files.append(FileMeta(path=f"data/{filename}"))
 
         self._write_meta(table, meta)
+        return True
 
     def _flush_full(self, table: str):
         """Write consolidated data file(s); untouched partition files are preserved."""

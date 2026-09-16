@@ -76,6 +76,19 @@ class TestCommit:
         orders.commit()
         assert orders._tx is None
 
+    def test_commit_after_zero_row_insert_restores_view(self, orders):
+        """An INSERT ... SELECT that adds zero rows takes the insert-only
+        buffer's early-return path in Transaction._flush_insert_only(),
+        which skips _write_meta() (and the view rebuild it triggers)
+        entirely. flush()'s phase 3 must still restore the view in this
+        case — otherwise it's left pointing at the dropped temp table."""
+        cur = orders.cursor()
+        cur.execute("INSERT INTO orders SELECT * FROM orders WHERE 1 = 0")
+        orders.commit()
+
+        cur.execute("SELECT COUNT(*) FROM orders")
+        assert cur.fetchone()[0] == 0
+
 
 class TestRollback:
     def test_rollback_discards_insert(self, orders):

@@ -1,5 +1,7 @@
+import datetime
 import re
 import sys
+import time
 
 import duckdb
 
@@ -69,6 +71,39 @@ def _parse_http_log_message(message: str) -> tuple[str, str, str | None, int | N
     return method.group(1), url.group(1), status, duration, extent
 
 
+def _describe_boto3_extent(op_name: str, http_response, parsed: dict, body_len: int | None) -> str:
+    """Same idea as _describe_extent(), but for a boto3 S3 call — bucketdb's
+    own writes (writer.py) and metadata reads/ETag checks (transaction.py),
+    none of which go through DuckDB's httpfs."""
+    if op_name == "HeadObject":
+        return "metadata"
+    if op_name == "GetObject":
+        length = http_response.headers.get("Content-Length")
+        return f"full ({length}B)" if length else "?"
+    if op_name == "PutObject":
+        return f"write ({body_len}B)" if body_len is not None else "write"
+    if op_name == "DeleteObject":
+        return "delete"
+    if op_name == "DeleteObjects":
+        n = len((parsed or {}).get("Deleted", []))
+        return f"delete ({n})"
+    if op_name == "ListObjectsV2":
+        return f"list ({(parsed or {}).get('KeyCount', '?')})"
+    return "?"
+
+
+def _emit_s3_log_line(time_display: str, method: str, status_display: str,
+                       duration_ms: int | None, extent: str, url: str):
+    duration_display = f"{duration_ms}ms" if duration_ms is not None else "?"
+    text = (
+        f"[s3] {time_display}  {method:<5} {status_display:>3}  {duration_display:>6}  "
+        f"{extent:<22}  {url}"
+    )
+    if sys.stdout.isatty():
+        text = f"{_GRAY}{text}{_RESET}"
+    print(text)
+
+
 class S3QLConnection:
     # PEP 249 requires exceptions accessible on the connection object
     Warning = Warning
@@ -92,6 +127,7 @@ class S3QLConnection:
         self._setup_duckdb()
         if debug_http:
             self._enable_http_logging()
+            self._enable_boto3_logging()
         self._registry.discover()
         if debug_http:
             self._flush_http_log()
@@ -159,21 +195,33 @@ class S3QLConnection:
 
     def preload(self, *tables: str):
         self._assert_open()
-        self._get_or_begin_tx().preload(*tables)
+        try:
+            self._get_or_begin_tx().preload(*tables)
+        finally:
+            if self._debug_http:
+                self._flush_http_log()
 
     def unload(self, *tables: str):
         self._assert_open()
         if self._tx is None:
             raise InterfaceError("No active transaction — nothing to unload")
-        self._tx.unload(*tables)
-        if not self._tx._loaded:
-            self._tx = None
+        try:
+            self._tx.unload(*tables)
+            if not self._tx._loaded:
+                self._tx = None
+        finally:
+            if self._debug_http:
+                self._flush_http_log()
 
     def vacuum(self, table_name: str):
         """Compact all data files for a table into one, applying sort key if set."""
         self._assert_open()
         from .writer import vacuum as do_vacuum
-        do_vacuum(self, table_name)
+        try:
+            do_vacuum(self, table_name)
+        finally:
+            if self._debug_http:
+                self._flush_http_log()
 
     def _get_or_begin_tx(self) -> Transaction:
         if self._tx is None:
@@ -260,11 +308,52 @@ class S3QLConnection:
         time_display = f"{time_match.group(1)}.{time_match.group(2)}" if time_match else "?"
         status_code = re.search(r"(\d+)$", status) if status else None
         status_display = status_code.group(1) if status_code else (status or "?")
-        duration_display = f"{duration}ms" if duration is not None else "?"
-        text = (
-            f"[s3] {time_display}  {method:<5} {status_display:>3}  {duration_display:>6}  "
-            f"{extent:<22}  {url}"
-        )
-        if sys.stdout.isatty():
-            text = f"{_GRAY}{text}{_RESET}"
-        print(text)
+        _emit_s3_log_line(time_display, method, status_display, duration, extent, url)
+
+    # ------------------------------------------------------------------
+    # boto3 request logging (writes + metadata reads never seen by DuckDB)
+    # ------------------------------------------------------------------
+
+    def _enable_boto3_logging(self):
+        """Print every real S3 request bucketdb itself makes via boto3.
+
+        Writes (CREATE/DROP TABLE, INSERT/UPDATE/DELETE flush) and the
+        _meta.json reads/ETag checks in transaction.py go straight through
+        boto3 — never through DuckDB (see writer.py) — so _flush_http_log()
+        never sees them. botocore's before-call/after-call events fire
+        synchronously inside the boto3 client method call itself, so unlike
+        DuckDB's async file-backed logging there is no separate pipeline to
+        race here: the line prints the instant the call returns, always.
+        """
+        events = self._registry.s3_client.meta.events
+        events.register("before-call.s3.*", self._before_boto3_call)
+        events.register("after-call.s3.*", self._after_boto3_call)
+
+    @staticmethod
+    def _before_boto3_call(params, context, **kwargs):
+        context["_bucketdb_start"] = time.monotonic()
+        context["_bucketdb_method"] = params.get("method", "?")
+        context["_bucketdb_url"] = params.get("url", "?")
+        # botocore wraps a PUT's Body in its own BytesIO by this point;
+        # .getbuffer().nbytes reads its size without touching the read
+        # position, so the actual upload is unaffected.
+        body = params.get("body")
+        if isinstance(body, (bytes, bytearray)):
+            body_len = len(body)
+        elif hasattr(body, "getbuffer"):
+            body_len = body.getbuffer().nbytes
+        else:
+            body_len = None
+        context["_bucketdb_body_len"] = body_len
+
+    def _after_boto3_call(self, http_response, parsed, model, context, **kwargs):
+        if not self._debug_http:
+            return
+        start = context.get("_bucketdb_start")
+        duration_ms = int((time.monotonic() - start) * 1000) if start is not None else None
+        method = context.get("_bucketdb_method", "?")
+        url = context.get("_bucketdb_url", "?")
+        status_display = str(getattr(http_response, "status_code", "?"))
+        extent = _describe_boto3_extent(model.name, http_response, parsed, context.get("_bucketdb_body_len"))
+        time_display = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        _emit_s3_log_line(time_display, method, status_display, duration_ms, extent, url)
