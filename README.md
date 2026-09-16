@@ -1,5 +1,7 @@
 # bucketdb
 
+[![PyPI](https://img.shields.io/pypi/v/bucketdb)](https://pypi.org/project/bucketdb/)
+
 A PEP 249-compliant Python SQL driver backed by **DuckDB** and **S3**.
 
 Each table is stored as one or more Parquet files on S3. DuckDB is the query engine. The driver exposes a standard DB-API 2.0 interface so it works as a drop-in wherever a Python database driver is expected.
