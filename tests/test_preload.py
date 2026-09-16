@@ -65,7 +65,7 @@ class TestPreload:
         # table still exists on S3 unchanged
         response = s3.list_objects_v2(Bucket=BUCKET)
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "orders.parquet" in keys
+        assert "orders/_meta.json" in keys
 
     def test_preload_rollback_clears_tx(self, tables):
         tables.preload("orders")
@@ -124,7 +124,12 @@ class TestUnload:
         assert "customers" in tables._tx._loaded
 
     def test_unload_without_preload_raises(self, tables):
-        with pytest.raises(ProgrammingError):
+        # tx must be active (via a different preloaded table) for this to
+        # exercise Transaction.unload()'s own check — with no active tx at
+        # all, S3QLConnection.unload() raises InterfaceError instead (see
+        # test_unload_without_tx_raises).
+        tables.preload("customers")
+        with pytest.raises(ProgrammingError, match="not preloaded"):
             tables.unload("orders")
 
     def test_unload_without_tx_raises(self, conn):

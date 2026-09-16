@@ -9,15 +9,24 @@ import pytest
 
 import bucketdb
 from bucketdb.exceptions import OperationalError
+from bucketdb.meta import FileMeta, TableMeta, write_meta
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
 
-def _put_parquet(s3_client, key: str, table: pa.Table):
+def _concurrent_write(s3_client, table_name: str, schema_cols: list, table: pa.Table):
+    """Simulate an external writer replacing a table's data out from under
+    us: a new data file plus a rewritten _meta.json pointing only at it.
+    Writing a fresh _meta.json (rather than reusing byte-identical content)
+    is what changes its ETag — that's what our conflict detection keys off."""
     buf = io.BytesIO()
     pq.write_table(table, buf)
     buf.seek(0)
-    s3_client.put_object(Bucket=BUCKET, Key=key, Body=buf.getvalue())
+    s3_client.put_object(
+        Bucket=BUCKET, Key=f"{table_name}/data/part-concurrent.parquet", Body=buf.getvalue()
+    )
+    meta = TableMeta(schema=schema_cols, files=[FileMeta(path="data/part-concurrent.parquet")])
+    write_meta(s3_client, BUCKET, f"{table_name}/_meta.json", meta)
 
 
 @pytest.fixture()
@@ -177,7 +186,7 @@ class TestConflict:
                 {"id": [99], "amount": [0.0]},
                 schema=pa.schema([("id", pa.int32()), ("amount", pa.float64())]),
             )
-            _put_parquet(s3, "orders.parquet", new_table)
+            _concurrent_write(s3, "orders", [["id", "INTEGER"], ["amount", "DOUBLE"]], new_table)
 
             # Our commit must detect the ETag mismatch
             with pytest.raises(OperationalError, match="conflict"):
@@ -211,7 +220,7 @@ class TestConflict:
                 {"id": [99], "amount": [0.0]},
                 schema=pa.schema([("id", pa.int32()), ("amount", pa.float64())]),
             )
-            _put_parquet(s3, "orders.parquet", new_table)
+            _concurrent_write(s3, "orders", [["id", "INTEGER"], ["amount", "DOUBLE"]], new_table)
 
             with pytest.raises(OperationalError):
                 conn.commit()
@@ -289,22 +298,29 @@ class TestMultiTableAtomicity:
                 {"id": [99], "delta": [0.0]},
                 schema=pa.schema([("id", pa.int32()), ("delta", pa.float64())]),
             )
-            _put_parquet(s3, "ledger.parquet", new_ledger)
+            _concurrent_write(s3, "ledger", [["id", "INTEGER"], ["delta", "DOUBLE"]], new_ledger)
 
             with pytest.raises(OperationalError, match="conflict"):
                 conn.commit()
 
             # accounts must NOT have been written: it was still empty on S3
             # (the conflict on 'ledger' is caught in the verify phase, before
-            # any write happens for any table).
-            accounts_obj = s3.get_object(Bucket=BUCKET, Key="accounts.parquet")
-            accounts_table = pq.read_table(io.BytesIO(accounts_obj["Body"].read()))
-            assert accounts_table.num_rows == 0
+            # any write happens for any table). Check via a fresh connection
+            # so we're reading actual S3 state, not our own tx's buffer.
+            with bucketdb.connect(
+                bucket=BUCKET,
+                aws_access_key_id=FAKE_KEY,
+                aws_secret_access_key=FAKE_SECRET,
+                aws_region=REGION,
+                endpoint_url=moto_server,
+            ) as verify_conn:
+                vcur = verify_conn.cursor()
+                vcur.execute("SELECT COUNT(*) FROM accounts")
+                assert vcur.fetchone()[0] == 0
 
-            # ledger on S3 must still be exactly what the concurrent writer wrote
-            ledger_obj = s3.get_object(Bucket=BUCKET, Key="ledger.parquet")
-            ledger_table = pq.read_table(io.BytesIO(ledger_obj["Body"].read()))
-            assert ledger_table.column("id").to_pylist() == [99]
+                # ledger on S3 must still be exactly what the concurrent writer wrote
+                vcur.execute("SELECT id FROM ledger")
+                assert vcur.fetchone()[0] == 99
 
             # The transaction is still active: reads go through the in-memory
             # buffer (read-your-writes), not the S3 state, until rollback/commit.
@@ -333,10 +349,10 @@ class TestMultiTableAtomicity:
             cur.execute("INSERT INTO ledger VALUES (1, 100.0)")
 
             # Corrupt both tables concurrently
-            for key, col in [("accounts.parquet", "balance"), ("ledger.parquet", "delta")]:
+            for table_name, col in [("accounts", "balance"), ("ledger", "delta")]:
                 schema = pa.schema([("id", pa.int32()), (col, pa.float64())])
                 t = pa.table({"id": [0], col: [0.0]}, schema=schema)
-                _put_parquet(s3, key, t)
+                _concurrent_write(s3, table_name, [["id", "INTEGER"], [col, "DOUBLE"]], t)
 
             with pytest.raises(OperationalError, match="conflict"):
                 conn.commit()
@@ -359,7 +375,7 @@ class TestDDLNonTransactional:
         # No commit yet — file must already exist on S3
         response = s3.list_objects_v2(Bucket=BUCKET)
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "immediate.parquet" in keys
+        assert "immediate/_meta.json" in keys
 
     def test_create_table_not_rolled_back(self, conn, s3):
         """Rolling back does NOT undo a CREATE TABLE."""
@@ -369,7 +385,7 @@ class TestDDLNonTransactional:
         # Table must still exist on S3 after rollback
         response = s3.list_objects_v2(Bucket=BUCKET)
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "permanent.parquet" in keys
+        assert "permanent/_meta.json" in keys
 
     def test_drop_table_visible_immediately(self, conn, s3):
         """DROP TABLE removes the file from S3 before commit."""
@@ -380,7 +396,7 @@ class TestDDLNonTransactional:
         # No commit — file must already be gone
         response = s3.list_objects_v2(Bucket=BUCKET)
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "todrop.parquet" not in keys
+        assert "todrop/_meta.json" not in keys
 
     def test_drop_table_not_rolled_back(self, conn, s3):
         """Rolling back does NOT restore a DROPped table."""
@@ -392,7 +408,7 @@ class TestDDLNonTransactional:
         # Table must still be gone after rollback
         response = s3.list_objects_v2(Bucket=BUCKET)
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "gone.parquet" not in keys
+        assert "gone/_meta.json" not in keys
 
     def test_dml_after_ddl_in_same_session(self, conn):
         """DDL followed by DML in the same session works correctly."""
@@ -414,5 +430,5 @@ class TestDDLNonTransactional:
         cur.execute("CREATE TABLE extra (id INTEGER)")
         response = s3.list_objects_v2(Bucket=BUCKET)
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "extra.parquet" in keys
+        assert "extra/_meta.json" in keys
         conn.rollback()

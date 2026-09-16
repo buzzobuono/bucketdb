@@ -1,11 +1,5 @@
-import csv
-import os
 import re
-import shutil
 import sys
-import tempfile
-import threading
-import time
 
 import duckdb
 
@@ -99,6 +93,8 @@ class S3QLConnection:
         if debug_http:
             self._enable_http_logging()
         self._registry.discover()
+        if debug_http:
+            self._flush_http_log()
 
     # ------------------------------------------------------------------
     # PEP 249 interface
@@ -111,20 +107,26 @@ class S3QLConnection:
 
     def commit(self):
         self._assert_open()
-        if self._tx:
-            self._tx.flush()
-            self._tx = None
+        try:
+            if self._tx:
+                self._tx.flush()
+                self._tx = None
+        finally:
+            if self._debug_http:
+                self._flush_http_log()
 
     def rollback(self):
         self._assert_open()
-        if self._tx:
-            self._tx.discard()
-            self._tx = None
+        try:
+            if self._tx:
+                self._tx.discard()
+                self._tx = None
+        finally:
+            if self._debug_http:
+                self._flush_http_log()
 
     def close(self):
         if not self._closed:
-            if self._debug_http:
-                self._stop_http_logging()
             self._db.close()
             self._closed = True
 
@@ -200,26 +202,25 @@ class S3QLConnection:
             raise OperationalError(f"Failed to initialize DuckDB S3 extension: {exc}") from exc
 
     def _enable_http_logging(self):
-        """Print every real HTTP request DuckDB's httpfs makes to S3.
+        """Turn on DuckDB's structured HTTP logging, read back via SQL.
 
-        DuckDB's logger can only write to its own storage backends, not call
-        back into Python, and it can only write to stdout by taking over the
-        process's real fd 1 — which also happens to be exactly what GNU
-        Readline uses to draw the interactive prompt (arrow-key history,
-        line editing). Redirecting fd 1 for the logger breaks Readline, so
-        instead the logger writes to a private file and a background thread
-        tails it and prints each entry as it arrives — real-time, without
-        any synchronisation to query boundaries.
+        DuckDB keeps log entries in its own in-memory, queryable table
+        (`duckdb_logs()`) rather than only being able to write to a file or
+        to stdout. Because a DuckDB connection executes one statement at a
+        time on a single thread, the log write for an HTTP call happens in
+        the same execution context as the call itself — by the time
+        db.execute() returns from a statement, every entry that statement
+        produced is already committed to that table. Reading it right after
+        (see _flush_http_log) is therefore exact: no polling, no background
+        thread, no file, and no possible lag — unlike an earlier version of
+        this that tailed a log file DuckDB wrote to asynchronously, which
+        could and did occasionally print a call's line late or not at all.
 
         Only covers reads: writes go through boto3's put_object (see
         writer.py), never through DuckDB.
         """
         try:
-            self._http_log_dir = tempfile.mkdtemp(prefix="bucketdb_http_")
-            self._db.execute(
-                "CALL enable_logging(storage='file', storage_path=?, level='DEBUG');",
-                [self._http_log_dir],
-            )
+            self._db.execute("CALL enable_logging(level='DEBUG');")
             # enabled_log_types must be set *after* enable_logging(), which
             # otherwise resets it back to "all types".
             self._db.execute("SET logging_mode='ENABLE_SELECTED';")
@@ -227,45 +228,35 @@ class S3QLConnection:
         except Exception as exc:
             raise OperationalError(f"Failed to enable DuckDB HTTP logging: {exc}") from exc
 
-        self._http_log_stop = threading.Event()
-        self._http_log_thread = threading.Thread(
-            target=self._tail_http_log, daemon=True
-        )
-        self._http_log_thread.start()
+    def _flush_http_log(self):
+        """Print every HTTP request DuckDB has made since the last flush,
+        then clear the log table. Call this right after a statement
+        completes (see __init__/commit/rollback and cursor.execute's
+        finally) so its own S3 calls — and only its own — are printed.
 
-    def _tail_http_log(self):
-        path = os.path.join(self._http_log_dir, "duckdb_log_entries.csv")
-        while not self._http_log_stop.is_set() and not os.path.exists(path):
-            time.sleep(0.01)
-        if self._http_log_stop.is_set():
+        Casting `timestamp` to VARCHAR in SQL (rather than fetching it as a
+        native TIMESTAMPTZ) avoids requiring the optional `pytz` package to
+        materialize it on the Python side.
+        """
+        if not self._debug_http:
             return
-
-        buffer = b""
-        with open(path, "rb") as f:
-            f.readline()  # header
-            while not self._http_log_stop.is_set():
-                chunk = f.read()
-                if not chunk:
-                    time.sleep(0.005)
-                    continue
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    self._print_http_log_line(line.decode("utf-8", errors="replace"))
+        rows = self._db.execute(
+            "SELECT timestamp::VARCHAR, message FROM duckdb_logs() "
+            "WHERE type = 'HTTP' ORDER BY timestamp"
+        ).fetchall()
+        if not rows:
+            return
+        for timestamp, message in rows:
+            self._print_http_log_line(timestamp, message)
+        self._db.execute("CALL truncate_duckdb_logs();")
 
     @staticmethod
-    def _print_http_log_line(line: str):
-        try:
-            row = next(csv.reader([line]))
-        except StopIteration:
-            return
-        if len(row) < 5 or row[2] != "HTTP":
-            return
-        parsed = _parse_http_log_message(row[4])
+    def _print_http_log_line(timestamp: str, message: str):
+        parsed = _parse_http_log_message(message)
         if not parsed:
             return
         method, url, status, duration, extent = parsed
-        time_match = _HTTP_TIMESTAMP_RE.search(row[1])
+        time_match = _HTTP_TIMESTAMP_RE.search(timestamp)
         time_display = f"{time_match.group(1)}.{time_match.group(2)}" if time_match else "?"
         status_code = re.search(r"(\d+)$", status) if status else None
         status_display = status_code.group(1) if status_code else (status or "?")
@@ -277,8 +268,3 @@ class S3QLConnection:
         if sys.stdout.isatty():
             text = f"{_GRAY}{text}{_RESET}"
         print(text)
-
-    def _stop_http_logging(self):
-        self._http_log_stop.set()
-        self._http_log_thread.join(timeout=1)
-        shutil.rmtree(self._http_log_dir, ignore_errors=True)

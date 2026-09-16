@@ -91,10 +91,16 @@ class TableRegistry:
     # ------------------------------------------------------------------
 
     def _register(self, name: str, meta: TableMeta):
-        # Update index name mapping
-        old_meta = self._metas.get(name)
-        if old_meta and old_meta.index_name:
-            self._indexes.pop(old_meta.index_name, None)
+        # Drop any index mapping this table previously owned. Looked up by
+        # scanning self._indexes rather than the outgoing TableMeta's
+        # index_name: callers (writer.py) mutate that TableMeta in place
+        # before calling register_table(), so by the time we get here
+        # old_meta and meta are frequently the *same* object and its
+        # index_name has already been overwritten.
+        stale = [idx for idx, table in self._indexes.items()
+                 if table == name and idx != meta.index_name]
+        for idx in stale:
+            del self._indexes[idx]
 
         self._metas[name] = meta
         if meta.index_name:

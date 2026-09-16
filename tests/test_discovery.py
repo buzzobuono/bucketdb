@@ -6,26 +6,35 @@ import pyarrow.parquet as pq
 import pytest
 
 import bucketdb
+from bucketdb.meta import FileMeta, TableMeta, write_meta
 
 from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
 
-def _upload_parquet(s3_client, key: str, table: pa.Table):
+def _seed_table(s3_client, prefix: str, table_name: str, schema_cols: list, table: pa.Table):
+    """Write a table directly to S3 the way bucketdb itself lays it out:
+    <prefix><table>/_meta.json + <prefix><table>/data/<file>.parquet — as an
+    external writer (or a table created by a prior connection) would leave it."""
+    filename = "part-seed.parquet"
     buf = io.BytesIO()
     pq.write_table(table, buf)
     buf.seek(0)
-    s3_client.put_object(Bucket=BUCKET, Key=key, Body=buf.getvalue())
+    s3_client.put_object(
+        Bucket=BUCKET, Key=f"{prefix}{table_name}/data/{filename}", Body=buf.getvalue()
+    )
+    meta = TableMeta(schema=schema_cols, files=[FileMeta(path=f"data/{filename}")])
+    write_meta(s3_client, BUCKET, f"{prefix}{table_name}/_meta.json", meta)
 
 
 @pytest.fixture()
 def prepopulated_s3(s3):
     schema = pa.schema([("id", pa.int32()), ("name", pa.string())])
     table = pa.table({"id": [1, 2, 3], "name": ["alice", "bob", "carol"]}, schema=schema)
-    _upload_parquet(s3, "customers.parquet", table)
+    _seed_table(s3, "", "customers", [["id", "INTEGER"], ["name", "VARCHAR"]], table)
 
     orders_schema = pa.schema([("order_id", pa.int32()), ("amount", pa.float64())])
     orders = pa.table({"order_id": [10, 20], "amount": [99.0, 5.5]}, schema=orders_schema)
-    _upload_parquet(s3, "orders.parquet", orders)
+    _seed_table(s3, "", "orders", [["order_id", "INTEGER"], ["amount", "DOUBLE"]], orders)
 
     yield s3
 
@@ -71,8 +80,8 @@ class TestDiscovery:
         """Tables outside the prefix must not be discovered."""
         schema = pa.schema([("x", pa.int32())])
         t = pa.table({"x": [1]}, schema=schema)
-        _upload_parquet(s3, "outside.parquet", t)
-        _upload_parquet(s3, "ns/inside.parquet", t)
+        _seed_table(s3, "", "outside", [["x", "INTEGER"]], t)
+        _seed_table(s3, "ns/", "inside", [["x", "INTEGER"]], t)
 
         with bucketdb.connect(
             bucket=BUCKET,

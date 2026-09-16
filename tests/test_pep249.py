@@ -19,25 +19,25 @@ from .conftest import BUCKET, FAKE_KEY, FAKE_SECRET, REGION
 
 class TestModuleAttributes:
     def test_apilevel(self):
-        assert s3ql.apilevel == "2.0"
+        assert bucketdb.apilevel == "2.0"
 
     def test_threadsafety(self):
-        assert s3ql.threadsafety in (0, 1, 2, 3)
+        assert bucketdb.threadsafety in (0, 1, 2, 3)
 
     def test_paramstyle(self):
-        assert s3ql.paramstyle in ("qmark", "numeric", "named", "format", "pyformat")
+        assert bucketdb.paramstyle in ("qmark", "numeric", "named", "format", "pyformat")
 
     def test_connect_callable(self):
         assert callable(bucketdb.connect)
 
     def test_module_exports_type_objects(self):
         for name in ("STRING", "BINARY", "NUMBER", "DATETIME", "ROWID"):
-            assert hasattr(s3ql, name), f"s3ql.{name} missing"
+            assert hasattr(bucketdb, name), f"bucketdb.{name} missing"
 
     def test_module_exports_type_constructors(self):
         for name in ("Date", "Time", "Timestamp", "Binary",
                      "DateFromTicks", "TimeFromTicks", "TimestampFromTicks"):
-            assert hasattr(s3ql, name), f"s3ql.{name} missing"
+            assert hasattr(bucketdb, name), f"bucketdb.{name} missing"
 
     def test_module_exports_all_exceptions(self):
         for name in (
@@ -45,7 +45,7 @@ class TestModuleAttributes:
             "DataError", "OperationalError", "IntegrityError",
             "InternalError", "ProgrammingError", "NotSupportedError",
         ):
-            assert hasattr(s3ql, name), f"s3ql.{name} missing"
+            assert hasattr(bucketdb, name), f"bucketdb.{name} missing"
 
     def test_exception_hierarchy(self):
         assert issubclass(bucketdb.Warning, Exception)

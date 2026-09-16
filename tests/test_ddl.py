@@ -14,7 +14,7 @@ class TestCreateTable:
         cur.execute("CREATE TABLE products (id INTEGER, price DOUBLE)")
         response = s3.list_objects_v2(Bucket="test-bucket")
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "products.parquet" in keys
+        assert "products/_meta.json" in keys
 
     def test_create_table_if_not_exists(self, conn):
         cur = conn.cursor()
@@ -32,7 +32,7 @@ class TestCreateTable:
         cur.execute("CREATE TABLE items (id INTEGER, label VARCHAR)")
         response = s3.list_objects_v2(Bucket="test-bucket", Prefix="warehouse/")
         keys = [o["Key"] for o in response.get("Contents", [])]
-        assert "warehouse/items.parquet" in keys
+        assert "warehouse/items/_meta.json" in keys
 
 
 class TestDropTable:
