@@ -248,6 +248,7 @@ DROP INDEX IF EXISTS idx_name
 - Partition values containing `/` or `=` are not supported
 - Partition pruning is metadata-driven (file list filtered before passing to DuckDB), not Hive-style glob — file-level pruning works correctly but DuckDB cannot do further intra-file pruning based on the partition column alone
 - Range partitioning (e.g. partition by month from a daily timestamp) is not yet supported — add a derived column and partition on that
+- **Partition filter extraction is limited to simple equality conditions** (`col = 'value'` or `col = 42`) — `IN` lists, `BETWEEN`, `OR`, and compound expressions fall back to a full load of all partition files. This affects both SELECT (file-level pruning) and UPDATE/DELETE (partial load)
 
 ---
 
@@ -383,3 +384,9 @@ pytest tests/
 ```
 
 Tests use [moto](https://github.com/getmoto/moto) to mock S3 — no real AWS account needed. Because DuckDB's `httpfs` extension speaks raw HTTP directly to S3 (bypassing boto3/botocore), the fixtures run a real local `moto.server.ThreadedMotoServer` rather than the `@mock_aws` decorator, so both boto3 and DuckDB hit the same mock.
+
+---
+
+## Future improvements
+
+- **Richer partition filter extraction** — the current WHERE clause parser recognises only simple equality conditions (`col = value`). Extending it to handle `col IN (...)`, conjunctions (`col1 = v1 AND col2 = v2`), and basic range expressions would allow the driver to prune partition files in a much wider set of real-world queries, both for SELECT (file-level pruning against `_meta.json`) and for UPDATE/DELETE (partial load, avoiding a full table read when only a subset of partitions is affected)
