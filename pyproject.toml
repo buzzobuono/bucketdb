@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "bucketdb"
-version = "0.1.0"
+dynamic = ["version"]
 description = "PEP 249 SQL driver backed by DuckDB + S3 (Parquet)"
 readme = "README.md"
 license = "MIT"
@@ -44,3 +44,7 @@ dev = ["pytest", "pytest-mock", "moto[s3,server]>=5"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["bucketdb*"]
+
+[tool.setuptools_scm]
+# version is derived from git tags (e.g. v1.0.0 → 1.0.0)
+# between tags: 1.0.0.dev3+gabcdef

@@ -1,5 +1,11 @@
 from datetime import date, datetime, time
 from decimal import Decimal
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("bucketdb")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 from .connection import S3QLConnection
 from .exceptions import (
